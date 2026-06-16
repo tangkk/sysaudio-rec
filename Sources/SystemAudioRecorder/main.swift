@@ -392,7 +392,7 @@ func printUsage() {
     print("""
     Usage: sysaudio-rec [options] [output-file-or-directory]
 
-    Records audio to MP3 until Ctrl-C.
+    Records audio to MP3 until Esc or Ctrl-C.
 
     Options:
       --device NAME      Record from an AVFoundation audio input, such as "Loopback Audio".
@@ -498,12 +498,87 @@ func blockInterruptSignal() {
     pthread_sigmask(SIG_BLOCK, &signals, nil)
 }
 
-func waitForInterrupt() -> Task<Void, Never> {
-    Task.detached {
-        var signals = interruptSignalSet()
-        var receivedSignal: Int32 = 0
-        sigwait(&signals, &receivedSignal)
+final class TerminalInputMode {
+    private var original = termios()
+    private var enabled = false
+
+    init() {
+        guard isatty(STDIN_FILENO) == 1, tcgetattr(STDIN_FILENO, &original) == 0 else {
+            return
+        }
+
+        var raw = original
+        raw.c_lflag &= ~tcflag_t(ICANON | ECHO)
+        withUnsafeMutableBytes(of: &raw.c_cc) { controlCharacters in
+            controlCharacters[Int(VMIN)] = 1
+            controlCharacters[Int(VTIME)] = 0
+        }
+
+        if tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0 {
+            enabled = true
+        }
     }
+
+    func restore() {
+        guard enabled else { return }
+        tcsetattr(STDIN_FILENO, TCSANOW, &original)
+        enabled = false
+    }
+
+    deinit {
+        restore()
+    }
+}
+
+final class StopContinuationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didResume = false
+    private let continuation: CheckedContinuation<Void, Never>
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func resumeOnce() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didResume else { return }
+        didResume = true
+        continuation.resume()
+    }
+}
+
+func waitForStopKeyOrInterrupt() async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        let state = StopContinuationState(continuation)
+
+        Thread.detachNewThread {
+            var signals = interruptSignalSet()
+            var receivedSignal: Int32 = 0
+            sigwait(&signals, &receivedSignal)
+            state.resumeOnce()
+        }
+
+        Thread.detachNewThread {
+            var byte: UInt8 = 0
+            while true {
+                let count = read(STDIN_FILENO, &byte, 1)
+                if count == 1, byte == 27 {
+                    state.resumeOnce()
+                    return
+                }
+                if count <= 0 {
+                    return
+                }
+            }
+        }
+    }
+}
+
+func withStopControls(_ operation: () async throws -> Void) async rethrows {
+    let terminalMode = TerminalInputMode()
+    defer { terminalMode.restore() }
+    try await operation()
 }
 
 func validateOutputFile(_ outputURL: URL) throws {
@@ -541,13 +616,14 @@ struct Main {
 
             if let deviceName = options.deviceName {
                 let recorder = FFMpegDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL)
-                let interruptTask = waitForInterrupt()
 
                 print("Recording AVFoundation audio device '\(deviceName)' to: \(options.outputURL.path)")
-                print("Press Ctrl-C to stop.")
+                print("Press Esc or Ctrl-C to stop.")
 
                 try recorder.start()
-                await interruptTask.value
+                await withStopControls {
+                    await waitForStopKeyOrInterrupt()
+                }
                 print("\nStopping...")
                 recorder.stop()
                 try validateOutputFile(options.outputURL)
@@ -558,13 +634,14 @@ struct Main {
             if #available(macOS 13.0, *) {
                 let writer = FFMpegMP3Writer(outputURL: options.outputURL)
                 let recorder = SystemAudioRecorder(writer: writer)
-                let interruptTask = waitForInterrupt()
 
                 print("Recording system audio to: \(options.outputURL.path)")
-                print("Press Ctrl-C to stop.")
+                print("Press Esc or Ctrl-C to stop.")
 
                 try await recorder.start()
-                await interruptTask.value
+                await withStopControls {
+                    await waitForStopKeyOrInterrupt()
+                }
                 print("\nStopping...")
                 await recorder.stop()
                 try validateOutputFile(options.outputURL)
@@ -574,11 +651,12 @@ struct Main {
 
                 print("macOS 13 native capture is unavailable; using AVFoundation audio device '\(defaultFallbackDeviceName)'.")
                 print("Recording to: \(options.outputURL.path)")
-                print("Press Ctrl-C to stop.")
+                print("Press Esc or Ctrl-C to stop.")
 
-                let interruptTask = waitForInterrupt()
                 try recorder.start()
-                await interruptTask.value
+                await withStopControls {
+                    await waitForStopKeyOrInterrupt()
+                }
                 print("\nStopping...")
                 recorder.stop()
                 try validateOutputFile(options.outputURL)

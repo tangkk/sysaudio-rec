@@ -77,4 +77,4 @@ Record to a specific file:
 .build/release/sysaudio-rec ~/Downloads/session.mp3
 ```
 
-Stop recording with `Ctrl-C`.
+Stop recording with `Esc` or `Ctrl-C`.
