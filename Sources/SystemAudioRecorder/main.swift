@@ -13,6 +13,8 @@ enum RecorderError: Error, CustomStringConvertible {
     case missingOptionValue(String)
     case unknownArgument(String)
     case ffmpegFailed(Int32)
+    case outputFileMissing(String)
+    case outputFileEmpty(String)
 
     var description: String {
         switch self {
@@ -32,6 +34,10 @@ enum RecorderError: Error, CustomStringConvertible {
             return "Unknown argument: \(argument)"
         case .ffmpegFailed(let status):
             return "ffmpeg exited with status \(status)."
+        case .outputFileMissing(let path):
+            return "Recording stopped, but no output file was created at \(path)."
+        case .outputFileEmpty(let path):
+            return "Recording stopped, but the output file is empty: \(path)"
         }
     }
 }
@@ -104,6 +110,7 @@ final class FFMpegDeviceRecorder {
     private let deviceName: String
     private let outputURL: URL
     private let process = Process()
+    private let inputPipe = Pipe()
     private var started = false
 
     init(deviceName: String, outputURL: URL) {
@@ -125,6 +132,7 @@ final class FFMpegDeviceRecorder {
             "-y",
             outputURL.path
         ]
+        process.standardInput = inputPipe
         try process.run()
         started = true
     }
@@ -132,7 +140,8 @@ final class FFMpegDeviceRecorder {
     func stop() {
         guard started else { return }
         started = false
-        kill(process.processIdentifier, SIGINT)
+        inputPipe.fileHandleForWriting.write(Data("q\n".utf8))
+        inputPipe.fileHandleForWriting.closeFile()
         process.waitUntilExit()
     }
 }
@@ -470,17 +479,35 @@ func parseOptions(arguments: [String]) throws -> Options {
     )
 }
 
-func waitForInterrupt() -> Task<Void, Never> {
-    let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    signal(SIGINT, SIG_IGN)
+func interruptSignalSet() -> sigset_t {
+    var signals = sigset_t()
+    sigemptyset(&signals)
+    sigaddset(&signals, SIGINT)
+    return signals
+}
 
-    return Task {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            signalSource.setEventHandler {
-                continuation.resume()
-            }
-            signalSource.resume()
-        }
+func blockInterruptSignal() {
+    var signals = interruptSignalSet()
+    pthread_sigmask(SIG_BLOCK, &signals, nil)
+}
+
+func waitForInterrupt() -> Task<Void, Never> {
+    Task.detached {
+        var signals = interruptSignalSet()
+        var receivedSignal: Int32 = 0
+        sigwait(&signals, &receivedSignal)
+    }
+}
+
+func validateOutputFile(_ outputURL: URL) throws {
+    guard FileManager.default.fileExists(atPath: outputURL.path) else {
+        throw RecorderError.outputFileMissing(outputURL.path)
+    }
+
+    let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
+    let size = attributes[.size] as? NSNumber
+    if size?.int64Value == 0 {
+        throw RecorderError.outputFileEmpty(outputURL.path)
     }
 }
 
@@ -488,6 +515,7 @@ func waitForInterrupt() -> Task<Void, Never> {
 struct Main {
     static func main() async {
         do {
+            blockInterruptSignal()
             let options = try parseOptions(arguments: CommandLine.arguments)
 
             if options.help {
@@ -506,15 +534,16 @@ struct Main {
 
             if let deviceName = options.deviceName {
                 let recorder = FFMpegDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL)
+                let interruptTask = waitForInterrupt()
 
                 print("Recording AVFoundation audio device '\(deviceName)' to: \(options.outputURL.path)")
                 print("Press Ctrl-C to stop.")
 
                 try recorder.start()
-                let interruptTask = waitForInterrupt()
                 await interruptTask.value
                 print("\nStopping...")
                 recorder.stop()
+                try validateOutputFile(options.outputURL)
                 print("Saved: \(options.outputURL.path)")
                 return
             }
@@ -531,6 +560,7 @@ struct Main {
                 await interruptTask.value
                 print("\nStopping...")
                 await recorder.stop()
+                try validateOutputFile(options.outputURL)
                 print("Saved: \(options.outputURL.path)")
             } else {
                 let recorder = FFMpegDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL)
@@ -539,11 +569,12 @@ struct Main {
                 print("Recording to: \(options.outputURL.path)")
                 print("Press Ctrl-C to stop.")
 
-                try recorder.start()
                 let interruptTask = waitForInterrupt()
+                try recorder.start()
                 await interruptTask.value
                 print("\nStopping...")
                 recorder.stop()
+                try validateOutputFile(options.outputURL)
                 print("Saved: \(options.outputURL.path)")
             }
         } catch {
