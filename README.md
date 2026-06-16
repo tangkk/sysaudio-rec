@@ -20,10 +20,11 @@ brew install ffmpeg
 
 Native route-independent system audio capture is not available on macOS 12. On
 macOS 12 and older, the default recorder uses a Loopback device named
-`Loopback Audio`. The Loopback fallback records through AVFoundation with a
-larger live input queue, wall-clock timestamps, and async resampling to reduce
-dropouts or timing drift. Use `--device` only if your virtual input has a
-different name.
+`Loopback Audio`. The Loopback fallback records through CoreAudio, uses the
+device's actual sample rate and channel layout, and writes PCM to `ffmpeg` from
+a background queue so the realtime audio callback is not blocked. If the device
+has more than two input channels, the recorder uses channels 1 and 2 for the
+MP3. Use `--device` only if your virtual input has a different name.
 
 The first run may prompt for Screen Recording permission. If capture does not
 start, allow the terminal app you are using in:
@@ -44,7 +45,7 @@ The binary will be at:
 
 ## Usage
 
-List devices visible to `ffmpeg`:
+List CoreAudio input devices:
 
 ```sh
 .build/release/sysaudio-rec --list-devices
@@ -59,7 +60,7 @@ Record to a timestamped MP3 in `~/Downloads`:
 On macOS 13 or newer, this uses native system audio capture. On macOS 12 and
 older, this records from `Loopback Audio`.
 
-Record from a different AVFoundation audio input:
+Record from a different CoreAudio input device:
 
 ```sh
 .build/release/sysaudio-rec --device "Some Other Device"

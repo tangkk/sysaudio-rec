@@ -15,6 +15,8 @@ enum RecorderError: Error, CustomStringConvertible {
     case ffmpegFailed(Int32)
     case outputFileMissing(String)
     case outputFileEmpty(String)
+    case audioDeviceNotFound(String)
+    case coreAudioError(String, OSStatus)
 
     var description: String {
         switch self {
@@ -38,6 +40,10 @@ enum RecorderError: Error, CustomStringConvertible {
             return "Recording stopped, but no output file was created at \(path)."
         case .outputFileEmpty(let path):
             return "Recording stopped, but the output file is empty: \(path)"
+        case .audioDeviceNotFound(let name):
+            return "Audio input device not found: \(name)"
+        case .coreAudioError(let operation, let status):
+            return "\(operation) failed with CoreAudio status \(status)."
         }
     }
 }
@@ -55,6 +61,7 @@ final class FFMpegMP3Writer {
     private let outputURL: URL
     private let process = Process()
     private let inputPipe = Pipe()
+    private let writeQueue = DispatchQueue(label: "sysaudio-rec.ffmpeg-writer")
     private var started = false
     private let lock = NSLock()
 
@@ -62,7 +69,7 @@ final class FFMpegMP3Writer {
         self.outputURL = outputURL
     }
 
-    func startIfNeeded(sampleRate: Double, channels: Int) throws {
+    func startIfNeeded(sampleRate: Double, channels: Int, outputChannels: Int? = nil) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -77,11 +84,18 @@ final class FFMpegMP3Writer {
             "-ar", String(Int(sampleRate.rounded())),
             "-ac", String(channels),
             "-i", "pipe:0",
+        ]
+        if let outputChannels, channels > 2, outputChannels == 2 {
+            process.arguments?.append(contentsOf: ["-filter:a", "pan=stereo|c0=c0|c1=c1"])
+        } else if let outputChannels {
+            process.arguments?.append(contentsOf: ["-ac", String(outputChannels)])
+        }
+        process.arguments?.append(contentsOf: [
             "-codec:a", "libmp3lame",
             "-b:a", "192k",
             "-y",
             outputURL.path
-        ]
+        ])
         process.standardInput = inputPipe
         try process.run()
         started = true
@@ -89,9 +103,14 @@ final class FFMpegMP3Writer {
 
     func write(_ data: Data) {
         lock.lock()
-        defer { lock.unlock() }
-        guard started else { return }
-        inputPipe.fileHandleForWriting.write(data)
+        guard started else {
+            lock.unlock()
+            return
+        }
+        writeQueue.async { [inputPipe] in
+            inputPipe.fileHandleForWriting.write(data)
+        }
+        lock.unlock()
     }
 
     func finish() {
@@ -101,7 +120,9 @@ final class FFMpegMP3Writer {
         lock.unlock()
 
         guard wasStarted else { return }
-        inputPipe.fileHandleForWriting.closeFile()
+        writeQueue.sync {
+            inputPipe.fileHandleForWriting.closeFile()
+        }
         process.waitUntilExit()
     }
 }
@@ -150,6 +171,313 @@ final class FFMpegDeviceRecorder {
         inputPipe.fileHandleForWriting.write(Data("q\n".utf8))
         inputPipe.fileHandleForWriting.closeFile()
         process.waitUntilExit()
+    }
+}
+
+struct CoreAudioDevice {
+    let id: AudioDeviceID
+    let name: String
+    let uid: String
+    let sampleRate: Double
+    let inputChannels: Int
+}
+
+func checkAudioStatus(_ status: OSStatus, _ operation: String) throws {
+    guard status == noErr else {
+        throw RecorderError.coreAudioError(operation, status)
+    }
+}
+
+func audioObjectPropertyDataSize(
+    _ objectID: AudioObjectID,
+    _ selector: AudioObjectPropertySelector,
+    _ scope: AudioObjectPropertyScope
+) throws -> UInt32 {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
+    )
+    var size: UInt32 = 0
+    try checkAudioStatus(
+        AudioObjectGetPropertyDataSize(objectID, &address, 0, nil, &size),
+        "AudioObjectGetPropertyDataSize(\(selector))"
+    )
+    return size
+}
+
+func audioObjectStringProperty(
+    _ objectID: AudioObjectID,
+    _ selector: AudioObjectPropertySelector
+) throws -> String {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
+        mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
+    )
+    var value: CFString = "" as CFString
+    var size = UInt32(MemoryLayout<CFString>.size)
+    try checkAudioStatus(
+        AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value),
+        "AudioObjectGetPropertyData(\(selector))"
+    )
+    return value as String
+}
+
+func audioDeviceNominalSampleRate(_ deviceID: AudioDeviceID) throws -> Double {
+    var address = AudioObjectPropertyAddress(
+        mSelector: AudioObjectPropertySelector(kAudioDevicePropertyNominalSampleRate),
+        mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
+        mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
+    )
+    var sampleRate = Float64(0)
+    var size = UInt32(MemoryLayout<Float64>.size)
+    try checkAudioStatus(
+        AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &sampleRate),
+        "AudioObjectGetPropertyData(kAudioDevicePropertyNominalSampleRate)"
+    )
+    return Double(sampleRate)
+}
+
+func audioDeviceInputChannelCount(_ deviceID: AudioDeviceID) throws -> Int {
+    var address = AudioObjectPropertyAddress(
+        mSelector: AudioObjectPropertySelector(kAudioDevicePropertyStreamConfiguration),
+        mScope: AudioObjectPropertyScope(kAudioDevicePropertyScopeInput),
+        mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
+    )
+    var size: UInt32 = 0
+    try checkAudioStatus(
+        AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size),
+        "AudioObjectGetPropertyDataSize(kAudioDevicePropertyStreamConfiguration)"
+    )
+    guard size > 0 else { return 0 }
+
+    let raw = UnsafeMutableRawPointer.allocate(
+        byteCount: Int(size),
+        alignment: MemoryLayout<AudioBufferList>.alignment
+    )
+    defer { raw.deallocate() }
+
+    try checkAudioStatus(
+        AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, raw),
+        "AudioObjectGetPropertyData(kAudioDevicePropertyStreamConfiguration)"
+    )
+
+    let audioBufferList = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+    let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+    return buffers.reduce(0) { $0 + Int($1.mNumberChannels) }
+}
+
+func coreAudioInputDevices() throws -> [CoreAudioDevice] {
+    let size = try audioObjectPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject),
+        AudioObjectPropertySelector(kAudioHardwarePropertyDevices),
+        AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal)
+    )
+    let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+    var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
+    var address = AudioObjectPropertyAddress(
+        mSelector: AudioObjectPropertySelector(kAudioHardwarePropertyDevices),
+        mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
+        mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
+    )
+    var mutableSize = size
+    try checkAudioStatus(
+        AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &mutableSize,
+            &deviceIDs
+        ),
+        "AudioObjectGetPropertyData(kAudioHardwarePropertyDevices)"
+    )
+
+    return try deviceIDs.compactMap { deviceID in
+        let channelCount = try audioDeviceInputChannelCount(deviceID)
+        guard channelCount > 0 else { return nil }
+        return CoreAudioDevice(
+            id: deviceID,
+            name: try audioObjectStringProperty(deviceID, AudioObjectPropertySelector(kAudioObjectPropertyName)),
+            uid: try audioObjectStringProperty(deviceID, AudioObjectPropertySelector(kAudioDevicePropertyDeviceUID)),
+            sampleRate: try audioDeviceNominalSampleRate(deviceID),
+            inputChannels: channelCount
+        )
+    }
+}
+
+func coreAudioInputDevice(named name: String) throws -> CoreAudioDevice {
+    if let exact = try coreAudioInputDevices().first(where: { $0.name == name }) {
+        return exact
+    }
+    if let caseInsensitive = try coreAudioInputDevices().first(where: { $0.name.lowercased() == name.lowercased() }) {
+        return caseInsensitive
+    }
+    throw RecorderError.audioDeviceNotFound(name)
+}
+
+final class CoreAudioDeviceRecorder {
+    private let deviceName: String
+    private let writer: FFMpegMP3Writer
+    private var queue: AudioQueueRef?
+    private var isRunning = false
+    private let lock = NSLock()
+
+    init(deviceName: String, outputURL: URL) {
+        self.deviceName = deviceName
+        self.writer = FFMpegMP3Writer(outputURL: outputURL)
+    }
+
+    func start() throws {
+        let device = try coreAudioInputDevice(named: deviceName)
+        let channels = min(max(device.inputChannels, 1), 2)
+        let sampleRate = device.sampleRate > 0 ? device.sampleRate : 44_100
+
+        var format = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(channels * MemoryLayout<Int16>.size),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(channels * MemoryLayout<Int16>.size),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: UInt32(MemoryLayout<Int16>.size * 8),
+            mReserved: 0
+        )
+
+        let userData = Unmanaged.passUnretained(self).toOpaque()
+        var newQueue: AudioQueueRef?
+        try checkAudioStatus(
+            AudioQueueNewInput(
+                &format,
+                { userData, queue, buffer, _, numberPackets, _ in
+                    guard let userData else { return }
+                    let recorder = Unmanaged<CoreAudioDeviceRecorder>
+                        .fromOpaque(userData)
+                        .takeUnretainedValue()
+                    recorder.handleInputBuffer(queue: queue, buffer: buffer, numberPackets: numberPackets)
+                },
+                userData,
+                nil,
+                nil,
+                0,
+                &newQueue
+            ),
+            "AudioQueueNewInput"
+        )
+        guard let newQueue else {
+            throw RecorderError.coreAudioError("AudioQueueNewInput", -1)
+        }
+
+        var deviceUID = device.uid as CFString
+        try checkAudioStatus(
+            withUnsafePointer(to: &deviceUID) { pointer in
+                AudioQueueSetProperty(
+                    newQueue,
+                    kAudioQueueProperty_CurrentDevice,
+                    pointer,
+                    UInt32(MemoryLayout<CFString>.size)
+                )
+            },
+            "AudioQueueSetProperty(kAudioQueueProperty_CurrentDevice)"
+        )
+
+        var actualFormat = AudioStreamBasicDescription()
+        var actualFormatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try checkAudioStatus(
+            AudioQueueGetProperty(
+                newQueue,
+                kAudioQueueProperty_StreamDescription,
+                &actualFormat,
+                &actualFormatSize
+            ),
+            "AudioQueueGetProperty(kAudioQueueProperty_StreamDescription)"
+        )
+        try validatePCMFormat(actualFormat)
+
+        let inputChannels = Int(actualFormat.mChannelsPerFrame)
+        try writer.startIfNeeded(
+            sampleRate: actualFormat.mSampleRate,
+            channels: inputChannels,
+            outputChannels: min(inputChannels, 2)
+        )
+
+        let framesPerBuffer = UInt32(actualFormat.mSampleRate / 4)
+        let bufferByteSize = max(UInt32(16_384), framesPerBuffer * actualFormat.mBytesPerFrame)
+        for _ in 0..<8 {
+            var buffer: AudioQueueBufferRef?
+            try checkAudioStatus(
+                AudioQueueAllocateBuffer(newQueue, bufferByteSize, &buffer),
+                "AudioQueueAllocateBuffer"
+            )
+            if let buffer {
+                try checkAudioStatus(
+                    AudioQueueEnqueueBuffer(newQueue, buffer, 0, nil),
+                    "AudioQueueEnqueueBuffer"
+                )
+            }
+        }
+
+        lock.lock()
+        queue = newQueue
+        isRunning = true
+        lock.unlock()
+
+        try checkAudioStatus(AudioQueueStart(newQueue, nil), "AudioQueueStart")
+    }
+
+    func stop() {
+        lock.lock()
+        let activeQueue = queue
+        isRunning = false
+        queue = nil
+        lock.unlock()
+
+        if let activeQueue {
+            AudioQueueStop(activeQueue, true)
+            AudioQueueDispose(activeQueue, true)
+        }
+        writer.finish()
+    }
+
+    private func handleInputBuffer(queue: AudioQueueRef, buffer: AudioQueueBufferRef, numberPackets: UInt32) {
+        lock.lock()
+        let shouldContinue = isRunning
+        lock.unlock()
+        guard shouldContinue else { return }
+
+        let byteCount = Int(buffer.pointee.mAudioDataByteSize)
+        if numberPackets > 0, byteCount > 0 {
+            writer.write(Data(bytes: buffer.pointee.mAudioData, count: byteCount))
+        }
+
+        lock.lock()
+        let shouldRequeue = isRunning
+        lock.unlock()
+        if shouldRequeue {
+            AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
+        }
+    }
+
+    private func validatePCMFormat(_ format: AudioStreamBasicDescription) throws {
+        let flags = format.mFormatFlags
+        let isSignedInteger = (flags & kAudioFormatFlagIsSignedInteger) != 0
+        let isPacked = (flags & kAudioFormatFlagIsPacked) != 0
+        let isNonInterleaved = (flags & kAudioFormatFlagIsNonInterleaved) != 0
+
+        guard format.mFormatID == kAudioFormatLinearPCM,
+              isSignedInteger,
+              isPacked,
+              !isNonInterleaved,
+              format.mBitsPerChannel == 16,
+              format.mChannelsPerFrame > 0,
+              format.mBytesPerFrame == format.mChannelsPerFrame * UInt32(MemoryLayout<Int16>.size)
+        else {
+            throw RecorderError.unsupportedAudioFormat(
+                "CoreAudio queue formatID=\(format.mFormatID), flags=\(flags), bits=\(format.mBitsPerChannel), channels=\(format.mChannelsPerFrame), bytesPerFrame=\(format.mBytesPerFrame)"
+            )
+        }
     }
 }
 
@@ -371,12 +699,11 @@ func ffmpegIsAvailable() -> Bool {
     }
 }
 
-func listAVFoundationDevices() throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "dummy"]
-    try process.run()
-    process.waitUntilExit()
+func listCoreAudioInputDevices() throws {
+    for (index, device) in try coreAudioInputDevices().enumerated() {
+        print("[\(index)] \(device.name) (\(Int(device.sampleRate.rounded())) Hz, \(device.inputChannels) input channels)")
+        print("    uid: \(device.uid)")
+    }
 }
 
 func defaultOutputURL() -> URL {
@@ -395,8 +722,8 @@ func printUsage() {
     Records audio to MP3 until Esc or Ctrl-C.
 
     Options:
-      --device NAME      Record from an AVFoundation audio input, such as "Loopback Audio".
-      --list-devices     List AVFoundation capture devices visible to ffmpeg.
+      --device NAME      Record from a CoreAudio input device, such as "Loopback Audio".
+      --list-devices     List CoreAudio input devices.
       -h, --help         Show this help.
 
     Without --device, macOS 13 or newer uses native route-independent system
@@ -610,14 +937,14 @@ struct Main {
             }
 
             if options.listDevices {
-                try listAVFoundationDevices()
+                try listCoreAudioInputDevices()
                 return
             }
 
             if let deviceName = options.deviceName {
-                let recorder = FFMpegDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL)
+                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL)
 
-                print("Recording AVFoundation audio device '\(deviceName)' to: \(options.outputURL.path)")
+                print("Recording CoreAudio input device '\(deviceName)' to: \(options.outputURL.path)")
                 print("Press Esc or Ctrl-C to stop.")
 
                 try recorder.start()
@@ -647,9 +974,9 @@ struct Main {
                 try validateOutputFile(options.outputURL)
                 print("Saved: \(options.outputURL.path)")
             } else {
-                let recorder = FFMpegDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL)
+                let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL)
 
-                print("macOS 13 native capture is unavailable; using AVFoundation audio device '\(defaultFallbackDeviceName)'.")
+                print("macOS 13 native capture is unavailable; using CoreAudio input device '\(defaultFallbackDeviceName)'.")
                 print("Recording to: \(options.outputURL.path)")
                 print("Press Esc or Ctrl-C to stop.")
 
