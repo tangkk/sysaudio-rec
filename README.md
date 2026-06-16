@@ -2,13 +2,13 @@
 
 `sysaudio-rec` is a macOS command-line audio recorder. On macOS 13 or newer, it
 records system audio through `ScreenCaptureKit`, so it captures system output
-regardless of which output device the audio is routed to. On macOS 12, it can
-record from a Loopback virtual audio input.
+regardless of which output device the audio is routed to. On macOS 12 and older,
+it records from the `Loopback Audio` virtual input by default.
 
 ## Requirements
 
 - macOS 13 or newer for native route-independent system audio capture
-- macOS 12 with Loopback for `--device` recording
+- macOS 12 with a Loopback device named `Loopback Audio`
 - Xcode command-line tools / Swift
 - `ffmpeg`
 
@@ -19,7 +19,8 @@ brew install ffmpeg
 ```
 
 Native route-independent system audio capture is not available on macOS 12. On
-macOS 12, use Loopback and pass the Loopback device name with `--device`.
+macOS 12 and older, the default recorder uses a Loopback device named
+`Loopback Audio`. Use `--device` only if your virtual input has a different name.
 
 The first run may prompt for Screen Recording permission. If capture does not
 start, allow the terminal app you are using in:
@@ -46,28 +47,31 @@ List devices visible to `ffmpeg`:
 .build/release/sysaudio-rec --list-devices
 ```
 
-Record native system audio to a timestamped MP3 in `~/Downloads` on macOS 13+:
+Record to a timestamped MP3 in `~/Downloads`:
 
 ```sh
 .build/release/sysaudio-rec
 ```
 
-Record from Loopback on macOS 12:
+On macOS 13 or newer, this uses native system audio capture. On macOS 12 and
+older, this records from `Loopback Audio`.
+
+Record from a different AVFoundation audio input:
 
 ```sh
-.build/release/sysaudio-rec --device "Loopback Audio"
+.build/release/sysaudio-rec --device "Some Other Device"
 ```
 
 Record into a directory:
 
 ```sh
-.build/release/sysaudio-rec --device "Loopback Audio" ~/Downloads/recordings
+.build/release/sysaudio-rec ~/Downloads/recordings
 ```
 
 Record to a specific file:
 
 ```sh
-.build/release/sysaudio-rec --device "Loopback Audio" ~/Downloads/session.mp3
+.build/release/sysaudio-rec ~/Downloads/session.mp3
 ```
 
 Stop recording with `Ctrl-C`.

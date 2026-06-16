@@ -43,6 +43,8 @@ struct Options {
     var help = false
 }
 
+let defaultFallbackDeviceName = "Loopback Audio"
+
 final class FFMpegMP3Writer {
     private let outputURL: URL
     private let process = Process()
@@ -381,9 +383,8 @@ func printUsage() {
       --list-devices     List AVFoundation capture devices visible to ffmpeg.
       -h, --help         Show this help.
 
-    Without --device, macOS 13 or newer is required for native route-independent
-    system audio capture. With --device, sysaudio-rec records whatever that input
-    device provides, which works with Loopback on macOS 12.
+    Without --device, macOS 13 or newer uses native route-independent system
+    audio capture. macOS 12 and older default to "Loopback Audio".
 
     If no output path is provided, a timestamped file is created in ~/Downloads.
     """)
@@ -532,7 +533,18 @@ struct Main {
                 await recorder.stop()
                 print("Saved: \(options.outputURL.path)")
             } else {
-                throw RecorderError.unsupportedOS
+                let recorder = FFMpegDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL)
+
+                print("macOS 13 native capture is unavailable; using AVFoundation audio device '\(defaultFallbackDeviceName)'.")
+                print("Recording to: \(options.outputURL.path)")
+                print("Press Ctrl-C to stop.")
+
+                try recorder.start()
+                let interruptTask = waitForInterrupt()
+                await interruptTask.value
+                print("\nStopping...")
+                recorder.stop()
+                print("Saved: \(options.outputURL.path)")
             }
         } catch {
             fputs("error: \(error)\n", stderr)
