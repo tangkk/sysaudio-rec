@@ -20,7 +20,10 @@ brew install ffmpeg
 
 Native route-independent system audio capture is not available on macOS 12. On
 macOS 12 and older, the default recorder uses a Loopback device named
-`Loopback Audio`. Use `--device` only if your virtual input has a different name.
+`Loopback Audio`. The Loopback fallback records through AVFoundation with a
+larger live input queue, wall-clock timestamps, and async resampling to reduce
+dropouts or timing drift. Use `--device` only if your virtual input has a
+different name.
 
 The first run may prompt for Screen Recording permission. If capture does not
 start, allow the terminal app you are using in:
