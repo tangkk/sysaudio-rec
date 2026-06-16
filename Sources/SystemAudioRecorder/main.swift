@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import CoreMedia
 import AudioToolbox
+import Darwin
 
 enum RecorderError: Error, CustomStringConvertible {
     case ffmpegNotFound
@@ -9,6 +10,9 @@ enum RecorderError: Error, CustomStringConvertible {
     case unsupportedAudioFormat(String)
     case invalidOutputPath(String)
     case unsupportedOS
+    case missingOptionValue(String)
+    case unknownArgument(String)
+    case ffmpegFailed(Int32)
 
     var description: String {
         switch self {
@@ -22,8 +26,21 @@ enum RecorderError: Error, CustomStringConvertible {
             return "Invalid output path: \(path)"
         case .unsupportedOS:
             return "Native route-independent system audio capture requires macOS 13 or newer."
+        case .missingOptionValue(let option):
+            return "Missing value for \(option)."
+        case .unknownArgument(let argument):
+            return "Unknown argument: \(argument)"
+        case .ffmpegFailed(let status):
+            return "ffmpeg exited with status \(status)."
         }
     }
+}
+
+struct Options {
+    var outputURL: URL
+    var deviceName: String?
+    var listDevices = false
+    var help = false
 }
 
 final class FFMpegMP3Writer {
@@ -77,6 +94,43 @@ final class FFMpegMP3Writer {
 
         guard wasStarted else { return }
         inputPipe.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+    }
+}
+
+final class FFMpegDeviceRecorder {
+    private let deviceName: String
+    private let outputURL: URL
+    private let process = Process()
+    private var started = false
+
+    init(deviceName: String, outputURL: URL) {
+        self.deviceName = deviceName
+        self.outputURL = outputURL
+    }
+
+    func start() throws {
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "avfoundation",
+            "-i", ":\(deviceName)",
+            "-vn",
+            "-codec:a", "libmp3lame",
+            "-b:a", "192k",
+            "-y",
+            outputURL.path
+        ]
+        try process.run()
+        started = true
+    }
+
+    func stop() {
+        guard started else { return }
+        started = false
+        kill(process.processIdentifier, SIGINT)
         process.waitUntilExit()
     }
 }
@@ -299,6 +353,14 @@ func ffmpegIsAvailable() -> Bool {
     }
 }
 
+func listAVFoundationDevices() throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "dummy"]
+    try process.run()
+    process.waitUntilExit()
+}
+
 func defaultOutputURL() -> URL {
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyyMMdd-HHmmss"
@@ -308,19 +370,28 @@ func defaultOutputURL() -> URL {
         .appendingPathComponent(filename)
 }
 
-func resolveOutputURL(arguments: [String]) throws -> URL {
-    guard let rawPath = arguments.dropFirst().first else {
+func printUsage() {
+    print("""
+    Usage: sysaudio-rec [options] [output-file-or-directory]
+
+    Records audio to MP3 until Ctrl-C.
+
+    Options:
+      --device NAME      Record from an AVFoundation audio input, such as "Loopback Audio".
+      --list-devices     List AVFoundation capture devices visible to ffmpeg.
+      -h, --help         Show this help.
+
+    Without --device, macOS 13 or newer is required for native route-independent
+    system audio capture. With --device, sysaudio-rec records whatever that input
+    device provides, which works with Loopback on macOS 12.
+
+    If no output path is provided, a timestamped file is created in ~/Downloads.
+    """)
+}
+
+func resolveOutputURL(rawPath: String?) throws -> URL {
+    guard let rawPath else {
         return defaultOutputURL()
-    }
-
-    if rawPath == "-h" || rawPath == "--help" {
-        print("""
-        Usage: sysaudio-rec [output-file-or-directory]
-
-        Records currently playing system audio to MP3 until Ctrl-C.
-        If no output path is provided, a timestamped file is created in ~/Downloads.
-        """)
-        Foundation.exit(0)
     }
 
     let expandedPath: String
@@ -355,43 +426,111 @@ func resolveOutputURL(arguments: [String]) throws -> URL {
     return url
 }
 
+func parseOptions(arguments: [String]) throws -> Options {
+    var deviceName: String?
+    var listDevices = false
+    var help = false
+    var outputPath: String?
+
+    var index = 1
+    while index < arguments.count {
+        let argument = arguments[index]
+
+        switch argument {
+        case "-h", "--help":
+            help = true
+        case "--list-devices":
+            listDevices = true
+        case "--device":
+            let valueIndex = index + 1
+            guard valueIndex < arguments.count else {
+                throw RecorderError.missingOptionValue(argument)
+            }
+            deviceName = arguments[valueIndex]
+            index += 1
+        default:
+            if argument.hasPrefix("-") {
+                throw RecorderError.unknownArgument(argument)
+            }
+            if outputPath != nil {
+                throw RecorderError.unknownArgument(argument)
+            }
+            outputPath = argument
+        }
+
+        index += 1
+    }
+
+    return Options(
+        outputURL: try resolveOutputURL(rawPath: outputPath),
+        deviceName: deviceName,
+        listDevices: listDevices,
+        help: help
+    )
+}
+
+func waitForInterrupt() -> Task<Void, Never> {
+    let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    signal(SIGINT, SIG_IGN)
+
+    return Task {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            signalSource.setEventHandler {
+                continuation.resume()
+            }
+            signalSource.resume()
+        }
+    }
+}
+
 @main
 struct Main {
     static func main() async {
         do {
-            if CommandLine.arguments.dropFirst().first == "-h" || CommandLine.arguments.dropFirst().first == "--help" {
-                _ = try resolveOutputURL(arguments: CommandLine.arguments)
+            let options = try parseOptions(arguments: CommandLine.arguments)
+
+            if options.help {
+                printUsage()
+                return
+            }
+
+            guard ffmpegIsAvailable() else {
+                throw RecorderError.ffmpegNotFound
+            }
+
+            if options.listDevices {
+                try listAVFoundationDevices()
+                return
+            }
+
+            if let deviceName = options.deviceName {
+                let recorder = FFMpegDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL)
+
+                print("Recording AVFoundation audio device '\(deviceName)' to: \(options.outputURL.path)")
+                print("Press Ctrl-C to stop.")
+
+                try recorder.start()
+                let interruptTask = waitForInterrupt()
+                await interruptTask.value
+                print("\nStopping...")
+                recorder.stop()
+                print("Saved: \(options.outputURL.path)")
+                return
             }
 
             if #available(macOS 13.0, *) {
-                guard ffmpegIsAvailable() else {
-                    throw RecorderError.ffmpegNotFound
-                }
-
-                let outputURL = try resolveOutputURL(arguments: CommandLine.arguments)
-                let writer = FFMpegMP3Writer(outputURL: outputURL)
+                let writer = FFMpegMP3Writer(outputURL: options.outputURL)
                 let recorder = SystemAudioRecorder(writer: writer)
+                let interruptTask = waitForInterrupt()
 
-                let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-                signal(SIGINT, SIG_IGN)
-
-                let interruptTask = Task {
-                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                        signalSource.setEventHandler {
-                            continuation.resume()
-                        }
-                        signalSource.resume()
-                    }
-                }
-
-                print("Recording system audio to: \(outputURL.path)")
+                print("Recording system audio to: \(options.outputURL.path)")
                 print("Press Ctrl-C to stop.")
 
                 try await recorder.start()
                 await interruptTask.value
                 print("\nStopping...")
                 await recorder.stop()
-                print("Saved: \(outputURL.path)")
+                print("Saved: \(options.outputURL.path)")
             } else {
                 throw RecorderError.unsupportedOS
             }
