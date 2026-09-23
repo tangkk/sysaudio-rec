@@ -51,6 +51,12 @@ List CoreAudio input devices:
 .build/release/sysaudio-rec --list-devices
 ```
 
+For local integrations, return the same devices as JSON:
+
+```sh
+.build/release/sysaudio-rec --list-devices-json
+```
+
 Record to a timestamped MP3 in `~/Downloads`:
 
 ```sh
@@ -60,7 +66,7 @@ Record to a timestamped MP3 in `~/Downloads`:
 On macOS 13 or newer, this uses native system audio capture. On macOS 12 and
 older, this records from `Loopback Audio`.
 
-Record from a different CoreAudio input device:
+Record from a different CoreAudio input device, including a microphone:
 
 ```sh
 .build/release/sysaudio-rec --device "Some Other Device"

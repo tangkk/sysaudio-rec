@@ -53,6 +53,7 @@ struct Options {
     var deviceName: String?
     var meter = false
     var listDevices = false
+    var listDevicesJSON = false
     var help = false
 }
 
@@ -747,6 +748,19 @@ func listCoreAudioInputDevices() throws {
     }
 }
 
+func listCoreAudioInputDevicesJSON() throws {
+    let devices = try coreAudioInputDevices().map { device in
+        [
+            "name": device.name,
+            "uid": device.uid,
+            "sampleRate": Int(device.sampleRate.rounded()),
+            "inputChannels": device.inputChannels,
+        ] as [String: Any]
+    }
+    let data = try JSONSerialization.data(withJSONObject: devices, options: [])
+    print(String(decoding: data, as: UTF8.self))
+}
+
 func defaultOutputURL() -> URL {
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyyMMdd-HHmmss"
@@ -763,9 +777,10 @@ func printUsage() {
     Records audio to MP3 until Esc or Ctrl-C.
 
     Options:
-      --device NAME      Record from a CoreAudio input device, such as "Loopback Audio".
+      --device NAME      Record from a CoreAudio input device, such as a microphone or "Loopback Audio".
       --meter            Print RMS meter samples to stdout for a local UI.
       --list-devices     List CoreAudio input devices.
+      --list-devices-json  List CoreAudio input devices as JSON for local integrations.
       -h, --help         Show this help.
 
     Without --device, macOS 13 or newer uses native route-independent system
@@ -816,6 +831,7 @@ func parseOptions(arguments: [String]) throws -> Options {
     var deviceName: String?
     var meter = false
     var listDevices = false
+    var listDevicesJSON = false
     var help = false
     var outputPath: String?
 
@@ -828,6 +844,8 @@ func parseOptions(arguments: [String]) throws -> Options {
             help = true
         case "--list-devices":
             listDevices = true
+        case "--list-devices-json":
+            listDevicesJSON = true
         case "--device":
             let valueIndex = index + 1
             guard valueIndex < arguments.count else {
@@ -855,6 +873,7 @@ func parseOptions(arguments: [String]) throws -> Options {
         deviceName: deviceName,
         meter: meter,
         listDevices: listDevices,
+        listDevicesJSON: listDevicesJSON,
         help: help
     )
 }
@@ -984,6 +1003,11 @@ struct Main {
 
             if options.listDevices {
                 try listCoreAudioInputDevices()
+                return
+            }
+
+            if options.listDevicesJSON {
+                try listCoreAudioInputDevicesJSON()
                 return
             }
 
