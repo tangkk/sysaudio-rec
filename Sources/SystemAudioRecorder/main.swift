@@ -51,6 +51,7 @@ enum RecorderError: Error, CustomStringConvertible {
 struct Options {
     var outputURL: URL
     var deviceName: String?
+    var meter = false
     var listDevices = false
     var help = false
 }
@@ -62,11 +63,15 @@ final class FFMpegMP3Writer {
     private let process = Process()
     private let inputPipe = Pipe()
     private let writeQueue = DispatchQueue(label: "sysaudio-rec.ffmpeg-writer")
+    private let meterEnabled: Bool
+    private let meterQueue = DispatchQueue(label: "sysaudio-rec.meter")
     private var started = false
+    private var lastMeterNanos: UInt64 = 0
     private let lock = NSLock()
 
-    init(outputURL: URL) {
+    init(outputURL: URL, meterEnabled: Bool = false) {
         self.outputURL = outputURL
+        self.meterEnabled = meterEnabled
     }
 
     func startIfNeeded(sampleRate: Double, channels: Int, outputChannels: Int? = nil) throws {
@@ -111,6 +116,35 @@ final class FFMpegMP3Writer {
             inputPipe.fileHandleForWriting.write(data)
         }
         lock.unlock()
+        emitMeter(for: data)
+    }
+
+    private func emitMeter(for data: Data) {
+        guard meterEnabled else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        guard now - lastMeterNanos >= 50_000_000 else {
+            lock.unlock()
+            return
+        }
+        lastMeterNanos = now
+        lock.unlock()
+
+        var sum: Double = 0
+        var count = 0
+        data.withUnsafeBytes { rawBuffer in
+            let samples = rawBuffer.bindMemory(to: Int16.self)
+            for sample in samples {
+                let normalized = Double(sample) / Double(Int16.max)
+                sum += normalized * normalized
+                count += 1
+            }
+        }
+        let level = count > 0 ? sqrt(sum / Double(count)) : 0
+        meterQueue.async {
+            print("METER \\(level)")
+            fflush(stdout)
+        }
     }
 
     func finish() {
@@ -324,9 +358,9 @@ final class CoreAudioDeviceRecorder {
     private var isRunning = false
     private let lock = NSLock()
 
-    init(deviceName: String, outputURL: URL) {
+    init(deviceName: String, outputURL: URL, meterEnabled: Bool = false) {
         self.deviceName = deviceName
-        self.writer = FFMpegMP3Writer(outputURL: outputURL)
+        self.writer = FFMpegMP3Writer(outputURL: outputURL, meterEnabled: meterEnabled)
     }
 
     func start() throws {
@@ -723,6 +757,7 @@ func printUsage() {
 
     Options:
       --device NAME      Record from a CoreAudio input device, such as "Loopback Audio".
+      --meter            Print RMS meter samples to stdout for a local UI.
       --list-devices     List CoreAudio input devices.
       -h, --help         Show this help.
 
@@ -772,6 +807,7 @@ func resolveOutputURL(rawPath: String?) throws -> URL {
 
 func parseOptions(arguments: [String]) throws -> Options {
     var deviceName: String?
+    var meter = false
     var listDevices = false
     var help = false
     var outputPath: String?
@@ -792,6 +828,8 @@ func parseOptions(arguments: [String]) throws -> Options {
             }
             deviceName = arguments[valueIndex]
             index += 1
+        case "--meter":
+            meter = true
         default:
             if argument.hasPrefix("-") {
                 throw RecorderError.unknownArgument(argument)
@@ -808,6 +846,7 @@ func parseOptions(arguments: [String]) throws -> Options {
     return Options(
         outputURL: try resolveOutputURL(rawPath: outputPath),
         deviceName: deviceName,
+        meter: meter,
         listDevices: listDevices,
         help: help
     )
@@ -942,7 +981,7 @@ struct Main {
             }
 
             if let deviceName = options.deviceName {
-                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL)
+                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL, meterEnabled: options.meter)
 
                 print("Recording CoreAudio input device '\(deviceName)' to: \(options.outputURL.path)")
                 print("Press Esc or Ctrl-C to stop.")
@@ -959,7 +998,7 @@ struct Main {
             }
 
             if #available(macOS 13.0, *) {
-                let writer = FFMpegMP3Writer(outputURL: options.outputURL)
+                let writer = FFMpegMP3Writer(outputURL: options.outputURL, meterEnabled: options.meter)
                 let recorder = SystemAudioRecorder(writer: writer)
 
                 print("Recording system audio to: \(options.outputURL.path)")
@@ -974,7 +1013,7 @@ struct Main {
                 try validateOutputFile(options.outputURL)
                 print("Saved: \(options.outputURL.path)")
             } else {
-                let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL)
+                let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL, meterEnabled: options.meter)
 
                 print("macOS 13 native capture is unavailable; using CoreAudio input device '\(defaultFallbackDeviceName)'.")
                 print("Recording to: \(options.outputURL.path)")
