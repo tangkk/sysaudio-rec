@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import CoreMedia
 import AudioToolbox
+import AppKit
 import Darwin
 
 enum RecorderError: Error, CustomStringConvertible {
@@ -54,6 +55,7 @@ struct Options {
     var meter = false
     var listDevices = false
     var listDevicesJSON = false
+    var noGUI = false
     var help = false
 }
 
@@ -65,14 +67,16 @@ final class FFMpegMP3Writer {
     private let inputPipe = Pipe()
     private let writeQueue = DispatchQueue(label: "sysaudio-rec.ffmpeg-writer")
     private let meterEnabled: Bool
+    private let meterHandler: ((Double, Double) -> Void)?
     private let meterQueue = DispatchQueue(label: "sysaudio-rec.meter")
     private var started = false
     private var lastMeterNanos: UInt64 = 0
     private let lock = NSLock()
 
-    init(outputURL: URL, meterEnabled: Bool = false) {
+    init(outputURL: URL, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
         self.outputURL = outputURL
         self.meterEnabled = meterEnabled
+        self.meterHandler = meterHandler
     }
 
     func startIfNeeded(sampleRate: Double, channels: Int, outputChannels: Int? = nil) throws {
@@ -121,7 +125,7 @@ final class FFMpegMP3Writer {
     }
 
     private func emitMeter(for data: Data) {
-        guard meterEnabled else { return }
+        guard meterEnabled || meterHandler != nil else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         lock.lock()
         // ~60Hz metering keeps transient-rich music readable in a live waveform
@@ -150,8 +154,11 @@ final class FFMpegMP3Writer {
                 }
             }
             let level = count > 0 ? sqrt(sum / Double(count)) : 0
-            print("METER \(level) \(peak)")
-            fflush(stdout)
+            self.meterHandler?(level, peak)
+            if self.meterEnabled {
+                print("METER \(level) \(peak)")
+                fflush(stdout)
+            }
         }
     }
 
@@ -366,9 +373,9 @@ final class CoreAudioDeviceRecorder {
     private var isRunning = false
     private let lock = NSLock()
 
-    init(deviceName: String, outputURL: URL, meterEnabled: Bool = false) {
+    init(deviceName: String, outputURL: URL, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
         self.deviceName = deviceName
-        self.writer = FFMpegMP3Writer(outputURL: outputURL, meterEnabled: meterEnabled)
+        self.writer = FFMpegMP3Writer(outputURL: outputURL, meterEnabled: meterEnabled, meterHandler: meterHandler)
     }
 
     func start() throws {
@@ -779,6 +786,7 @@ func printUsage() {
     Options:
       --device NAME      Record from a CoreAudio input device, such as a microphone or "Loopback Audio".
       --meter            Print RMS meter samples to stdout for a local UI.
+      --no-gui           Run in terminal-only mode (used by local integrations).
       --list-devices     List CoreAudio input devices.
       --list-devices-json  List CoreAudio input devices as JSON for local integrations.
       -h, --help         Show this help.
@@ -832,6 +840,7 @@ func parseOptions(arguments: [String]) throws -> Options {
     var meter = false
     var listDevices = false
     var listDevicesJSON = false
+    var noGUI = false
     var help = false
     var outputPath: String?
 
@@ -846,6 +855,8 @@ func parseOptions(arguments: [String]) throws -> Options {
             listDevices = true
         case "--list-devices-json":
             listDevicesJSON = true
+        case "--no-gui":
+            noGUI = true
         case "--device":
             let valueIndex = index + 1
             guard valueIndex < arguments.count else {
@@ -874,6 +885,7 @@ func parseOptions(arguments: [String]) throws -> Options {
         meter: meter,
         listDevices: listDevices,
         listDevicesJSON: listDevicesJSON,
+        noGUI: noGUI,
         help: help
     )
 }
@@ -985,20 +997,221 @@ func validateOutputFile(_ outputURL: URL) throws {
     }
 }
 
+final class LiveWaveformView: NSView {
+    private var samples: [CGFloat] = []
+
+    func append(level: Double, peak: Double) {
+        samples.append(CGFloat(min(1, max(level, peak))))
+        if samples.count > 360 { samples.removeFirst(samples.count - 360) }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedWhite: 0.96, alpha: 1).setFill()
+        bounds.fill()
+        let midY = bounds.midY
+        NSColor(calibratedWhite: 0.78, alpha: 1).setStroke()
+        let center = NSBezierPath()
+        center.move(to: NSPoint(x: bounds.minX, y: midY))
+        center.line(to: NSPoint(x: bounds.maxX, y: midY))
+        center.stroke()
+        guard !samples.isEmpty else { return }
+
+        let barWidth = max(1, bounds.width / CGFloat(samples.count) - 1)
+        NSColor.systemRed.setFill()
+        for (index, sample) in samples.enumerated() {
+            let amplitude = max(0.02, sqrt(sample)) * bounds.height * 0.42
+            let x = CGFloat(index) * (barWidth + 1)
+            NSBezierPath(rect: NSRect(x: x, y: midY - amplitude, width: barWidth, height: amplitude * 2)).fill()
+        }
+    }
+}
+
+@MainActor
+final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private let options: Options
+    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 330), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    private let sourcePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let recordButton = NSButton(title: "● Record", target: nil, action: nil)
+    private let statusLabel = NSTextField(labelWithString: "Ready to record")
+    private let timerLabel = NSTextField(labelWithString: "00:00")
+    private let waveform = LiveWaveformView(frame: .zero)
+    private var coreRecorder: CoreAudioDeviceRecorder?
+    private var stopSystemRecorder: (() async -> Void)?
+    private var timer: Timer?
+    private var startedAt: Date?
+
+    init(options: Options) {
+        self.options = options
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        window.title = "sysaudio-rec"
+        window.delegate = self
+        window.center()
+
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        root.translatesAutoresizingMaskIntoConstraints = false
+
+        let sourceRow = NSStackView()
+        sourceRow.orientation = .horizontal
+        sourceRow.spacing = 8
+        sourceRow.addArrangedSubview(NSTextField(labelWithString: "Input source"))
+        sourcePopup.translatesAutoresizingMaskIntoConstraints = false
+        sourcePopup.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        sourcePopup.addItem(withTitle: "System audio / Loopback (default)")
+        sourcePopup.lastItem?.representedObject = ""
+        for device in (try? coreAudioInputDevices()) ?? [] {
+            sourcePopup.addItem(withTitle: "\(device.name)  ·  \(device.inputChannels) ch  ·  \(Int(device.sampleRate.rounded())) Hz")
+            sourcePopup.lastItem?.representedObject = device.name
+            if device.name == options.deviceName { sourcePopup.selectItem(at: sourcePopup.numberOfItems - 1) }
+        }
+        sourceRow.addArrangedSubview(sourcePopup)
+        root.addArrangedSubview(sourceRow)
+
+        waveform.translatesAutoresizingMaskIntoConstraints = false
+        waveform.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        waveform.heightAnchor.constraint(equalToConstant: 150).isActive = true
+        root.addArrangedSubview(waveform)
+
+        let footer = NSStackView()
+        footer.orientation = .horizontal
+        footer.spacing = 12
+        statusLabel.textColor = .secondaryLabelColor
+        footer.addArrangedSubview(statusLabel)
+        footer.addArrangedSubview(NSView())
+        timerLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        footer.addArrangedSubview(timerLabel)
+        recordButton.bezelColor = .systemRed
+        recordButton.target = self
+        recordButton.action = #selector(toggleRecording)
+        footer.addArrangedSubview(recordButton)
+        root.addArrangedSubview(footer)
+
+        let content = NSView()
+        content.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            root.topAnchor.constraint(equalTo: content.topAnchor),
+            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
+        window.contentView = content
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func toggleRecording() {
+        if coreRecorder != nil || stopSystemRecorder != nil {
+            Task { await stopRecording() }
+        } else {
+            Task { await startRecording() }
+        }
+    }
+
+    private func meterHandler() -> (Double, Double) -> Void {
+        { [weak self] level, peak in
+            DispatchQueue.main.async { self?.waveform.append(level: level, peak: peak) }
+        }
+    }
+
+    private func startRecording() async {
+        recordButton.isEnabled = false
+        statusLabel.stringValue = "Starting…"
+        let deviceName = sourcePopup.selectedItem?.representedObject as? String ?? ""
+        do {
+            if deviceName.isEmpty {
+                if #available(macOS 13.0, *) {
+                    let writer = FFMpegMP3Writer(outputURL: options.outputURL, meterHandler: meterHandler())
+                    let recorder = SystemAudioRecorder(writer: writer)
+                    try await recorder.start()
+                    stopSystemRecorder = { await recorder.stop() }
+                } else {
+                    let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL, meterHandler: meterHandler())
+                    try recorder.start()
+                    coreRecorder = recorder
+                }
+            } else {
+                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL, meterHandler: meterHandler())
+                try recorder.start()
+                coreRecorder = recorder
+            }
+            startedAt = Date()
+            let newTimer = Timer(timeInterval: 0.2, target: self, selector: #selector(updateTimer), userInfo: nil, repeats: true)
+            RunLoop.main.add(newTimer, forMode: .common)
+            timer = newTimer
+            sourcePopup.isEnabled = false
+            recordButton.title = "■ Stop recording"
+            recordButton.isEnabled = true
+            statusLabel.stringValue = "Recording to \(options.outputURL.lastPathComponent)"
+        } catch {
+            statusLabel.stringValue = "Error: \(error)"
+            recordButton.isEnabled = true
+        }
+    }
+
+    @objc private func updateTimer() {
+        guard let startedAt else { return }
+        let elapsed = Int(Date().timeIntervalSince(startedAt))
+        timerLabel.stringValue = String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
+    }
+
+    private func stopRecording() async {
+        recordButton.isEnabled = false
+        statusLabel.stringValue = "Finishing MP3…"
+        timer?.invalidate()
+        timer = nil
+        if let stop = stopSystemRecorder {
+            await stop()
+            stopSystemRecorder = nil
+        }
+        coreRecorder?.stop()
+        coreRecorder = nil
+        do {
+            try validateOutputFile(options.outputURL)
+            statusLabel.stringValue = "Saved: \(options.outputURL.path)"
+        } catch {
+            statusLabel.stringValue = "Error: \(error)"
+        }
+        sourcePopup.isEnabled = true
+        recordButton.title = "● Record"
+        recordButton.isEnabled = true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        Task {
+            if coreRecorder != nil || stopSystemRecorder != nil { await stopRecording() }
+            NSApp.terminate(nil)
+        }
+    }
+}
+
+private var guiRecorderController: GUIRecorderController?
+
+@MainActor
+func runGUI(options: Options) {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let controller = GUIRecorderController(options: options)
+    guiRecorderController = controller
+    app.delegate = controller
+    app.run()
+}
+
 @main
 struct Main {
     static func main() async {
         do {
-            blockInterruptSignal()
             let options = try parseOptions(arguments: CommandLine.arguments)
 
             if options.help {
                 printUsage()
                 return
-            }
-
-            guard ffmpegIsAvailable() else {
-                throw RecorderError.ffmpegNotFound
             }
 
             if options.listDevices {
@@ -1010,6 +1223,17 @@ struct Main {
                 try listCoreAudioInputDevicesJSON()
                 return
             }
+
+            guard ffmpegIsAvailable() else {
+                throw RecorderError.ffmpegNotFound
+            }
+
+            if !options.noGUI {
+                runGUI(options: options)
+                return
+            }
+
+            blockInterruptSignal()
 
             if let deviceName = options.deviceName {
                 let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL, meterEnabled: options.meter)

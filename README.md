@@ -43,6 +43,10 @@ The binary will be at:
 .build/release/sysaudio-rec
 ```
 
+Running the binary directly opens a lightweight recorder window with an input
+source picker and live waveform. Use `--no-gui` when embedding it in a local
+service or when terminal-only control is preferred.
+
 ## Usage
 
 List CoreAudio input devices:
@@ -70,6 +74,12 @@ Record from a different CoreAudio input device, including a microphone:
 
 ```sh
 .build/release/sysaudio-rec --device "Some Other Device"
+```
+
+Run without the native window:
+
+```sh
+.build/release/sysaudio-rec --no-gui --device "Built-in Microphone"
 ```
 
 Record into a directory:
