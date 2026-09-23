@@ -132,20 +132,23 @@ final class FFMpegMP3Writer {
         lastMeterNanos = now
         lock.unlock()
 
-        var sum: Double = 0
-        var peak: Double = 0
-        var count = 0
-        data.withUnsafeBytes { rawBuffer in
-            let samples = rawBuffer.bindMemory(to: Int16.self)
-            for sample in samples {
-                let normalized = Double(sample) / Double(Int16.max)
-                sum += normalized * normalized
-                peak = max(peak, abs(normalized))
-                count += 1
-            }
-        }
-        let level = count > 0 ? sqrt(sum / Double(count)) : 0
+        // This method can be called by a realtime CoreAudio callback. Keep the
+        // callback path to a quick timestamp check; calculate meter values on
+        // a separate queue so waveform reporting can never starve recording.
         meterQueue.async {
+            var sum: Double = 0
+            var peak: Double = 0
+            var count = 0
+            data.withUnsafeBytes { rawBuffer in
+                let samples = rawBuffer.bindMemory(to: Int16.self)
+                for sample in samples {
+                    let normalized = Double(sample) / Double(Int16.max)
+                    sum += normalized * normalized
+                    peak = max(peak, abs(normalized))
+                    count += 1
+                }
+            }
+            let level = count > 0 ? sqrt(sum / Double(count)) : 0
             print("METER \(level) \(peak)")
             fflush(stdout)
         }
