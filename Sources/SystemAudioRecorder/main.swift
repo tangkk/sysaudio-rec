@@ -1,6 +1,7 @@
 import Foundation
 import ScreenCaptureKit
 import CoreMedia
+import AVFoundation
 import AudioToolbox
 import AppKit
 import Darwin
@@ -1030,16 +1031,21 @@ final class LiveWaveformView: NSView {
 @MainActor
 final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let options: Options
-    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 330), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 380), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     private let sourcePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let recordButton = NSButton(title: "● Record", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "Ready to record")
     private let timerLabel = NSTextField(labelWithString: "00:00")
     private let waveform = LiveWaveformView(frame: .zero)
+    private let playbackButton = NSButton(title: "▶ Play", target: nil, action: nil)
+    private let playbackSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let playbackTimeLabel = NSTextField(labelWithString: "00:00 / 00:00")
     private var coreRecorder: CoreAudioDeviceRecorder?
     private var stopSystemRecorder: (() async -> Void)?
     private var timer: Timer?
     private var startedAt: Date?
+    private var player: AVPlayer?
+    private var playbackTimer: Timer?
 
     init(options: Options) {
         self.options = options
@@ -1047,7 +1053,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        window.title = "sysaudio-rec"
+        window.title = "sysaudio-rec · Web Media Inspector"
         window.delegate = self
         window.center()
 
@@ -1061,7 +1067,10 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         let sourceRow = NSStackView()
         sourceRow.orientation = .horizontal
         sourceRow.spacing = 8
-        sourceRow.addArrangedSubview(NSTextField(labelWithString: "Input source"))
+        let sourceLabel = NSTextField(labelWithString: "INPUT SOURCE")
+        sourceLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        sourceLabel.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
+        sourceRow.addArrangedSubview(sourceLabel)
         sourcePopup.translatesAutoresizingMaskIntoConstraints = false
         sourcePopup.widthAnchor.constraint(equalToConstant: 360).isActive = true
         sourcePopup.addItem(withTitle: "System audio / Loopback (default)")
@@ -1075,6 +1084,10 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         root.addArrangedSubview(sourceRow)
 
         waveform.translatesAutoresizingMaskIntoConstraints = false
+        waveform.wantsLayer = true
+        waveform.layer?.cornerRadius = 12
+        waveform.layer?.borderWidth = 1
+        waveform.layer?.borderColor = NSColor(calibratedWhite: 0.88, alpha: 1).cgColor
         waveform.widthAnchor.constraint(equalToConstant: 560).isActive = true
         waveform.heightAnchor.constraint(equalToConstant: 150).isActive = true
         root.addArrangedSubview(waveform)
@@ -1082,18 +1095,46 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         let footer = NSStackView()
         footer.orientation = .horizontal
         footer.spacing = 12
-        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        statusLabel.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
         footer.addArrangedSubview(statusLabel)
         footer.addArrangedSubview(NSView())
         timerLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         footer.addArrangedSubview(timerLabel)
-        recordButton.bezelColor = .systemRed
+        recordButton.bezelColor = NSColor(calibratedRed: 0.73, green: 0.11, blue: 0.11, alpha: 1)
+        recordButton.contentTintColor = .white
         recordButton.target = self
         recordButton.action = #selector(toggleRecording)
         footer.addArrangedSubview(recordButton)
         root.addArrangedSubview(footer)
 
+        let playback = NSStackView()
+        playback.orientation = .horizontal
+        playback.spacing = 10
+        playback.alignment = .centerY
+        let playbackLabel = NSTextField(labelWithString: "PLAYBACK")
+        playbackLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        playbackLabel.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
+        playback.addArrangedSubview(playbackLabel)
+        playbackButton.target = self
+        playbackButton.action = #selector(togglePlayback)
+        playbackButton.isEnabled = false
+        playback.addArrangedSubview(playbackButton)
+        playbackSlider.target = self
+        playbackSlider.action = #selector(seekPlayback)
+        playbackSlider.isContinuous = true
+        playbackSlider.isEnabled = false
+        playbackSlider.translatesAutoresizingMaskIntoConstraints = false
+        playbackSlider.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        playback.addArrangedSubview(playbackSlider)
+        playbackTimeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        playbackTimeLabel.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
+        playback.addArrangedSubview(playbackTimeLabel)
+        root.addArrangedSubview(playback)
+
         let content = NSView()
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor(calibratedRed: 0.965, green: 0.965, blue: 0.945, alpha: 1).cgColor
         content.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -1121,6 +1162,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     private func startRecording() async {
+        clearPlayback()
         recordButton.isEnabled = false
         statusLabel.stringValue = "Starting…"
         let deviceName = sourcePopup.selectedItem?.representedObject as? String ?? ""
@@ -1175,6 +1217,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         do {
             try validateOutputFile(options.outputURL)
             statusLabel.stringValue = "Saved: \(options.outputURL.path)"
+            preparePlayback(url: options.outputURL)
         } catch {
             statusLabel.stringValue = "Error: \(error)"
         }
@@ -1183,9 +1226,72 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         recordButton.isEnabled = true
     }
 
+    private func preparePlayback(url: URL) {
+        clearPlayback()
+        let newPlayer = AVPlayer(url: url)
+        player = newPlayer
+        playbackButton.isEnabled = true
+        playbackSlider.isEnabled = true
+        playbackSlider.doubleValue = 0
+        updatePlaybackUI()
+        let newTimer = Timer(timeInterval: 0.1, target: self, selector: #selector(updatePlaybackUI), userInfo: nil, repeats: true)
+        RunLoop.main.add(newTimer, forMode: .common)
+        playbackTimer = newTimer
+    }
+
+    private func clearPlayback() {
+        player?.pause()
+        player = nil
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+        playbackButton.title = "▶ Play"
+        playbackButton.isEnabled = false
+        playbackSlider.doubleValue = 0
+        playbackSlider.isEnabled = false
+        playbackTimeLabel.stringValue = "00:00 / 00:00"
+    }
+
+    @objc private func togglePlayback() {
+        guard let player else { return }
+        let duration = player.currentItem?.duration.seconds ?? 0
+        if player.rate == 0 {
+            if duration.isFinite, player.currentTime().seconds >= duration - 0.05 {
+                player.seek(to: .zero)
+            }
+            player.play()
+            playbackButton.title = "❚❚ Pause"
+        } else {
+            player.pause()
+            playbackButton.title = "▶ Play"
+        }
+    }
+
+    @objc private func seekPlayback() {
+        guard let player else { return }
+        player.seek(to: CMTime(seconds: playbackSlider.doubleValue, preferredTimescale: 600))
+        updatePlaybackUI()
+    }
+
+    @objc private func updatePlaybackUI() {
+        guard let player else { return }
+        let current = max(0, player.currentTime().seconds)
+        let duration = player.currentItem?.duration.seconds ?? 0
+        guard duration.isFinite, duration > 0 else { return }
+        playbackSlider.maxValue = duration
+        playbackSlider.doubleValue = min(current, duration)
+        playbackTimeLabel.stringValue = "\(Self.playbackTime(current)) / \(Self.playbackTime(duration))"
+        if current >= duration - 0.05, player.rate == 0 { playbackButton.title = "▶ Play" }
+    }
+
+    private static func playbackTime(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+
     func windowWillClose(_ notification: Notification) {
         Task {
             if coreRecorder != nil || stopSystemRecorder != nil { await stopRecording() }
+            clearPlayback()
             NSApp.terminate(nil)
         }
     }
