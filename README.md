@@ -95,3 +95,29 @@ Record to a specific file:
 ```
 
 Stop recording with `Esc` or `Ctrl-C`.
+
+## Use with Web Media Inspector
+
+A web page cannot launch a local binary by itself, so
+[Web Media Inspector](https://github.com/tangkk/web-media-inspector) talks to a
+small local service that runs `sysaudio-rec` on your Mac. If the page says
+`sysaudio-rec` is missing, or its Record button cannot connect, set it up like
+this:
+
+```sh
+# 1. Build sysaudio-rec (see Build above)
+git clone https://github.com/tangkk/sysaudio-rec.git ~/Projects/sysaudio-rec
+cd ~/Projects/sysaudio-rec && swift build -c release
+
+# 2. Start the local recording service (Node.js required)
+git clone https://github.com/tangkk/web-media-inspector.git ~/Projects/web-media-inspector
+cd ~/Projects/web-media-inspector
+npm install
+npm run recording-service   # or `npm run dev` to also serve the app locally
+```
+
+Keep the two repositories side by side under `~/Projects`, since the service
+looks for `~/Projects/sysaudio-rec/.build/release/sysaudio-rec`. The service
+listens on `http://localhost:5173`; keep it running while you record, then
+reload the page. To start it automatically, use
+`scripts/recording/start-recording-bridge.sh` from the web-media-inspector repo.
