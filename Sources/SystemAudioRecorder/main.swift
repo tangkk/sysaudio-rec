@@ -6,6 +6,22 @@ import AudioToolbox
 import AppKit
 import Darwin
 
+final class BlackArrowPopUpButton: NSPopUpButton {
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let arrowRect = NSRect(x: bounds.maxX - 24, y: bounds.midY - 9, width: 18, height: 18)
+        NSColor.controlBackgroundColor.setFill()
+        NSBezierPath(rect: arrowRect).fill()
+        NSColor.black.setStroke()
+        let arrow = NSBezierPath()
+        arrow.lineWidth = 1.5
+        arrow.move(to: NSPoint(x: arrowRect.minX + 5, y: arrowRect.midY + 2))
+        arrow.line(to: NSPoint(x: arrowRect.midX, y: arrowRect.midY - 3))
+        arrow.line(to: NSPoint(x: arrowRect.maxX - 5, y: arrowRect.midY + 2))
+        arrow.stroke()
+    }
+}
+
 enum RecorderError: Error, CustomStringConvertible {
     case ffmpegNotFound
     case noDisplay
@@ -1032,7 +1048,7 @@ final class LiveWaveformView: NSView {
 final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let options: Options
     private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 380), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-    private let sourcePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let sourcePopup = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
     private let recordButton = NSButton(title: "● Record", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "Ready to record")
     private let timerLabel = NSTextField(labelWithString: "00:00")
@@ -1073,6 +1089,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         sourceRow.addArrangedSubview(sourceLabel)
         sourcePopup.translatesAutoresizingMaskIntoConstraints = false
         sourcePopup.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        sourcePopup.contentTintColor = .black
         sourcePopup.addItem(withTitle: "System audio / Loopback (default)")
         sourcePopup.lastItem?.representedObject = ""
         for device in (try? coreAudioInputDevices()) ?? [] {
