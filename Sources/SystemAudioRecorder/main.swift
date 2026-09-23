@@ -123,7 +123,9 @@ final class FFMpegMP3Writer {
         guard meterEnabled else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         lock.lock()
-        guard now - lastMeterNanos >= 50_000_000 else {
+        // ~60Hz metering keeps transient-rich music readable in a live waveform
+        // while remaining cheap enough for the realtime capture callback.
+        guard now - lastMeterNanos >= 16_000_000 else {
             lock.unlock()
             return
         }
@@ -131,18 +133,20 @@ final class FFMpegMP3Writer {
         lock.unlock()
 
         var sum: Double = 0
+        var peak: Double = 0
         var count = 0
         data.withUnsafeBytes { rawBuffer in
             let samples = rawBuffer.bindMemory(to: Int16.self)
             for sample in samples {
                 let normalized = Double(sample) / Double(Int16.max)
                 sum += normalized * normalized
+                peak = max(peak, abs(normalized))
                 count += 1
             }
         }
         let level = count > 0 ? sqrt(sum / Double(count)) : 0
         meterQueue.async {
-            print("METER \\(level)")
+            print("METER \(level) \(peak)")
             fflush(stdout)
         }
     }
