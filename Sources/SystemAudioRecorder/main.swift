@@ -4,6 +4,7 @@ import CoreMedia
 import AVFoundation
 import AudioToolbox
 import AppKit
+import UniformTypeIdentifiers
 import Darwin
 
 final class BlackArrowPopUpButton: NSPopUpButton {
@@ -817,6 +818,27 @@ func defaultOutputURL() -> URL {
         .appendingPathComponent(filename)
 }
 
+func trimMP3(source: URL, destination: URL, start: Double, end: Double) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", source.path,
+        "-ss", String(start),
+        "-to", String(end),
+        "-c", "copy",
+        "-y",
+        destination.path,
+    ]
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw RecorderError.ffmpegFailed(process.terminationStatus)
+    }
+}
+
 func printUsage() {
     print("""
     Usage: sysaudio-rec [options] [output-file-or-directory]
@@ -1038,7 +1060,28 @@ func validateOutputFile(_ outputURL: URL) throws {
 }
 
 final class LiveWaveformView: NSView {
+    // Same rolling window and drawing formula as the original scrolling waveform.
+    // Recording stops appending to it, so once stopped the bars simply stay put —
+    // the trim UI only adds a selection overlay on top, it never redraws the bars
+    // with different data.
     private var samples: [CGFloat] = []
+    private var duration: Double = 0
+    private var selStart: CGFloat = 0
+    private var selEnd: CGFloat = 1
+    private var playheadFraction: CGFloat?
+    private(set) var isEditable = false
+
+    private enum DragMode {
+        case newSelection
+        case moveStart
+        case moveEnd
+    }
+    private var dragMode: DragMode?
+    private var dragAnchor: CGFloat = 0
+    private let minSelectionFraction: CGFloat = 0.01
+    private let handleTolerance: CGFloat = 7
+
+    var onSelectionChanged: ((Double, Double) -> Void)?
 
     func append(level: Double, peak: Double) {
         samples.append(CGFloat(min(1, max(level, peak))))
@@ -1046,23 +1089,147 @@ final class LiveWaveformView: NSView {
         needsDisplay = true
     }
 
+    /// Called once a recording stops and its duration is known. This does not
+    /// change what's drawn for the waveform bars themselves (append() is simply
+    /// no longer called) — it only turns on the draggable trim selection overlay.
+    func configureForPlayback(duration: Double) {
+        self.duration = duration
+        selStart = 0
+        selEnd = 1
+        playheadFraction = 0
+        isEditable = true
+        needsDisplay = true
+    }
+
+    func resetForNewRecording() {
+        samples.removeAll()
+        duration = 0
+        selStart = 0
+        selEnd = 1
+        playheadFraction = nil
+        isEditable = false
+        dragMode = nil
+        needsDisplay = true
+    }
+
+    /// Moves the playhead marker to the given playback position, in seconds.
+    func setPlayheadTime(_ seconds: Double) {
+        guard isEditable, duration > 0 else { return }
+        let fraction = CGFloat(max(0, min(1, seconds / duration)))
+        guard playheadFraction != fraction else { return }
+        playheadFraction = fraction
+        needsDisplay = true
+    }
+
+    func resetSelectionToFullRange() {
+        guard isEditable else { return }
+        selStart = 0
+        selEnd = 1
+        needsDisplay = true
+        onSelectionChanged?(0, duration)
+    }
+
+    private func fraction(for event: NSEvent) -> CGFloat {
+        let point = convert(event.locationInWindow, from: nil)
+        return max(0, min(1, bounds.width > 0 ? point.x / bounds.width : 0))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEditable, duration > 0 else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        let startX = selStart * bounds.width
+        let endX = selEnd * bounds.width
+
+        if abs(point.x - startX) <= handleTolerance {
+            dragMode = .moveStart
+        } else if abs(point.x - endX) <= handleTolerance {
+            dragMode = .moveEnd
+        } else {
+            dragMode = .newSelection
+            let clicked = fraction(for: event)
+            dragAnchor = clicked
+            selStart = clicked
+            selEnd = clicked
+        }
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isEditable, duration > 0, let mode = dragMode else { return }
+        let current = fraction(for: event)
+
+        switch mode {
+        case .newSelection:
+            if current < dragAnchor {
+                selStart = current
+                selEnd = dragAnchor
+            } else {
+                selStart = dragAnchor
+                selEnd = current
+            }
+        case .moveStart:
+            selStart = min(current, selEnd - minSelectionFraction)
+        case .moveEnd:
+            selEnd = max(current, selStart + minSelectionFraction)
+        }
+        needsDisplay = true
+        onSelectionChanged?(Double(selStart) * duration, Double(selEnd) * duration)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragMode = nil
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedWhite: 0.96, alpha: 1).setFill()
         bounds.fill()
         let midY = bounds.midY
+
+        if isEditable, duration > 0 {
+            let selectionRect = NSRect(
+                x: selStart * bounds.width,
+                y: 0,
+                width: (selEnd - selStart) * bounds.width,
+                height: bounds.height
+            )
+            NSColor.systemBlue.withAlphaComponent(0.14).setFill()
+            selectionRect.fill()
+        }
+
         NSColor(calibratedWhite: 0.78, alpha: 1).setStroke()
         let center = NSBezierPath()
         center.move(to: NSPoint(x: bounds.minX, y: midY))
         center.line(to: NSPoint(x: bounds.maxX, y: midY))
         center.stroke()
-        guard !samples.isEmpty else { return }
 
-        let barWidth = max(1, bounds.width / CGFloat(samples.count) - 1)
-        NSColor.systemRed.setFill()
-        for (index, sample) in samples.enumerated() {
-            let amplitude = max(0.02, sqrt(sample)) * bounds.height * 0.42
-            let x = CGFloat(index) * (barWidth + 1)
-            NSBezierPath(rect: NSRect(x: x, y: midY - amplitude, width: barWidth, height: amplitude * 2)).fill()
+        if !samples.isEmpty {
+            let barWidth = max(1, bounds.width / CGFloat(samples.count) - 1)
+            NSColor.systemRed.setFill()
+            for (index, sample) in samples.enumerated() {
+                let amplitude = max(0.02, sqrt(sample)) * bounds.height * 0.42
+                let x = CGFloat(index) * (barWidth + 1)
+                NSBezierPath(rect: NSRect(x: x, y: midY - amplitude, width: barWidth, height: amplitude * 2)).fill()
+            }
+        }
+
+        if isEditable, duration > 0 {
+            NSColor.systemBlue.setFill()
+            let startX = selStart * bounds.width
+            let endX = selEnd * bounds.width
+            NSBezierPath(rect: NSRect(x: startX - 1.5, y: 0, width: 3, height: bounds.height)).fill()
+            NSBezierPath(rect: NSRect(x: endX - 1.5, y: 0, width: 3, height: bounds.height)).fill()
+        }
+
+        if isEditable, duration > 0, let playheadFraction {
+            let x = playheadFraction * bounds.width
+            NSColor.black.setFill()
+            NSBezierPath(rect: NSRect(x: x - 1, y: 0, width: 2, height: bounds.height)).fill()
+            let marker = NSBezierPath()
+            marker.move(to: NSPoint(x: x - 5, y: bounds.height))
+            marker.line(to: NSPoint(x: x + 5, y: bounds.height))
+            marker.line(to: NSPoint(x: x, y: bounds.height - 8))
+            marker.close()
+            marker.fill()
         }
     }
 }
@@ -1070,7 +1237,7 @@ final class LiveWaveformView: NSView {
 @MainActor
 final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let options: Options
-    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 380), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 440), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     private let sourcePopup = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
     private let recordButton = NSButton(title: "● Record", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "Ready to record")
@@ -1079,12 +1246,22 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
     private let playbackButton = NSButton(title: "▶ Play", target: nil, action: nil)
     private let playbackSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let playbackTimeLabel = NSTextField(labelWithString: "00:00 / 00:00")
+    private let trimLabel = NSTextField(labelWithString: "Trim: 00:00 – 00:00")
+    private let resetTrimButton = NSButton(title: "Reset Trim", target: nil, action: nil)
+    private let saveButton = NSButton(title: "Save As…", target: nil, action: nil)
+    private let clearButton = NSButton(title: "✕ Clear", target: nil, action: nil)
     private var coreRecorder: CoreAudioDeviceRecorder?
     private var stopSystemRecorder: (() async -> Void)?
     private var timer: Timer?
     private var startedAt: Date?
     private var player: AVPlayer?
     private var playbackTimer: Timer?
+    private var recordingTempURL: URL?
+    private var suggestedSaveURL: URL?
+    private var trimBoundsInitialized = false
+    private var trimStart: Double = 0
+    private var trimEnd: Double = 0
+    private var trimDuration: Double = 0
 
     init(options: Options) {
         self.options = options
@@ -1130,6 +1307,19 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         waveform.layer?.borderColor = NSColor(calibratedWhite: 0.88, alpha: 1).cgColor
         waveform.widthAnchor.constraint(equalToConstant: 560).isActive = true
         waveform.heightAnchor.constraint(equalToConstant: 150).isActive = true
+        waveform.onSelectionChanged = { [weak self] start, end in
+            guard let self else { return }
+            self.trimStart = start
+            self.trimEnd = end
+            self.trimLabel.stringValue = "Trim: \(Self.playbackTime(start)) – \(Self.playbackTime(end))"
+            self.playbackSlider.minValue = start
+            self.playbackSlider.maxValue = end
+            if let player = self.player, player.rate == 0 {
+                player.seek(to: CMTime(seconds: start, preferredTimescale: 600))
+                self.playbackSlider.doubleValue = start
+                self.waveform.setPlayheadTime(start)
+            }
+        }
         root.addArrangedSubview(waveform)
 
         let footer = NSStackView()
@@ -1172,6 +1362,43 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         playback.addArrangedSubview(playbackTimeLabel)
         root.addArrangedSubview(playback)
 
+        let trimRow = NSStackView()
+        trimRow.orientation = .horizontal
+        trimRow.spacing = 10
+        trimRow.alignment = .centerY
+        let trimCaption = NSTextField(labelWithString: "TRIM")
+        trimCaption.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        trimCaption.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
+        trimRow.addArrangedSubview(trimCaption)
+        trimLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        trimLabel.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
+        trimRow.addArrangedSubview(trimLabel)
+        let trimHint = NSTextField(labelWithString: "Drag on the waveform above to set the trim range")
+        trimHint.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        trimHint.textColor = NSColor(calibratedWhite: 0.6, alpha: 1)
+        trimRow.addArrangedSubview(trimHint)
+        trimRow.addArrangedSubview(NSView())
+        resetTrimButton.target = self
+        resetTrimButton.action = #selector(resetTrim)
+        resetTrimButton.isEnabled = false
+        trimRow.addArrangedSubview(resetTrimButton)
+        root.addArrangedSubview(trimRow)
+
+        let saveRow = NSStackView()
+        saveRow.orientation = .horizontal
+        saveRow.spacing = 10
+        clearButton.target = self
+        clearButton.action = #selector(clearRecording)
+        clearButton.isEnabled = false
+        saveRow.addArrangedSubview(clearButton)
+        saveRow.addArrangedSubview(NSView())
+        saveButton.target = self
+        saveButton.action = #selector(saveRecording)
+        saveButton.isEnabled = false
+        saveButton.keyEquivalent = "\r"
+        saveRow.addArrangedSubview(saveButton)
+        root.addArrangedSubview(saveRow)
+
         let content = NSView()
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor(calibratedRed: 0.965, green: 0.965, blue: 0.945, alpha: 1).cgColor
@@ -1202,27 +1429,29 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     private func startRecording() async {
-        clearPlayback()
+        discardPendingRecording()
         recordButton.isEnabled = false
         statusLabel.stringValue = "Starting…"
         let deviceName = sourcePopup.selectedItem?.representedObject as? String ?? ""
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("sysaudio-rec-\(UUID().uuidString).mp3")
         do {
             if deviceName.isEmpty {
                 if #available(macOS 13.0, *) {
-                    let writer = FFMpegMP3Writer(outputURL: options.outputURL, meterHandler: meterHandler())
+                    let writer = FFMpegMP3Writer(outputURL: tempURL, meterHandler: meterHandler())
                     let recorder = SystemAudioRecorder(writer: writer)
                     try await recorder.start()
                     stopSystemRecorder = { await recorder.stop() }
                 } else {
-                    let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: options.outputURL, meterHandler: meterHandler())
+                    let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: tempURL, meterHandler: meterHandler())
                     try recorder.start()
                     coreRecorder = recorder
                 }
             } else {
-                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL, meterHandler: meterHandler())
+                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: tempURL, meterHandler: meterHandler())
                 try recorder.start()
                 coreRecorder = recorder
             }
+            recordingTempURL = tempURL
             startedAt = Date()
             let newTimer = Timer(timeInterval: 0.2, target: self, selector: #selector(updateTimer), userInfo: nil, repeats: true)
             RunLoop.main.add(newTimer, forMode: .common)
@@ -1230,7 +1459,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
             sourcePopup.isEnabled = false
             recordButton.title = "■ Stop recording"
             recordButton.isEnabled = true
-            statusLabel.stringValue = "Recording to \(options.outputURL.lastPathComponent)"
+            statusLabel.stringValue = "Recording…"
         } catch {
             statusLabel.stringValue = "Error: \(error)"
             recordButton.isEnabled = true
@@ -1254,16 +1483,28 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         }
         coreRecorder?.stop()
         coreRecorder = nil
-        do {
-            try validateOutputFile(options.outputURL)
-            statusLabel.stringValue = "Saved: \(options.outputURL.path)"
-            preparePlayback(url: options.outputURL)
-        } catch {
-            statusLabel.stringValue = "Error: \(error)"
+        if let tempURL = recordingTempURL {
+            do {
+                try validateOutputFile(tempURL)
+                statusLabel.stringValue = "Recording ready — trim it, then Save As…"
+                suggestedSaveURL = freshSuggestedSaveURL()
+                clearButton.isEnabled = true
+                preparePlayback(url: tempURL)
+            } catch {
+                statusLabel.stringValue = "Error: \(error)"
+                recordingTempURL = nil
+            }
         }
         sourcePopup.isEnabled = true
         recordButton.title = "● Record"
         recordButton.isEnabled = true
+    }
+
+    private func freshSuggestedSaveURL() -> URL {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let filename = "system-audio-\(formatter.string(from: Date())).mp3"
+        return options.outputURL.deletingLastPathComponent().appendingPathComponent(filename)
     }
 
     private func preparePlayback(url: URL) {
@@ -1293,10 +1534,10 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
 
     @objc private func togglePlayback() {
         guard let player else { return }
-        let duration = player.currentItem?.duration.seconds ?? 0
         if player.rate == 0 {
-            if duration.isFinite, player.currentTime().seconds >= duration - 0.05 {
-                player.seek(to: .zero)
+            let current = player.currentTime().seconds
+            if current < trimStart - 0.01 || current >= trimEnd - 0.02 {
+                player.seek(to: CMTime(seconds: trimStart, preferredTimescale: 600))
             }
             player.play()
             playbackButton.title = "❚❚ Pause"
@@ -1308,19 +1549,130 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
 
     @objc private func seekPlayback() {
         guard let player else { return }
-        player.seek(to: CMTime(seconds: playbackSlider.doubleValue, preferredTimescale: 600))
+        let clamped = min(max(playbackSlider.doubleValue, trimStart), trimEnd)
+        player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
+        waveform.setPlayheadTime(clamped)
         updatePlaybackUI()
     }
 
     @objc private func updatePlaybackUI() {
         guard let player else { return }
-        let current = max(0, player.currentTime().seconds)
+        var current = max(0, player.currentTime().seconds)
         let duration = player.currentItem?.duration.seconds ?? 0
         guard duration.isFinite, duration > 0 else { return }
-        playbackSlider.maxValue = duration
-        playbackSlider.doubleValue = min(current, duration)
-        playbackTimeLabel.stringValue = "\(Self.playbackTime(current)) / \(Self.playbackTime(duration))"
-        if current >= duration - 0.05, player.rate == 0 { playbackButton.title = "▶ Play" }
+
+        if !trimBoundsInitialized {
+            trimBoundsInitialized = true
+            trimDuration = duration
+            trimStart = 0
+            trimEnd = duration
+            trimLabel.stringValue = "Trim: \(Self.playbackTime(0)) – \(Self.playbackTime(duration))"
+            waveform.configureForPlayback(duration: duration)
+            resetTrimButton.isEnabled = true
+            saveButton.isEnabled = true
+            playbackSlider.minValue = 0
+            playbackSlider.maxValue = duration
+        }
+
+        // Preview playback never runs past the trimmed range.
+        if player.rate != 0, current >= trimEnd - 0.03 {
+            player.pause()
+            player.seek(to: CMTime(seconds: trimStart, preferredTimescale: 600))
+            playbackButton.title = "▶ Play"
+            current = trimStart
+        }
+
+        let displayed = max(0, min(current, duration))
+        playbackSlider.doubleValue = displayed
+        playbackTimeLabel.stringValue = "\(Self.playbackTime(displayed)) / \(Self.playbackTime(duration))"
+        waveform.setPlayheadTime(displayed)
+    }
+
+    @objc private func resetTrim() {
+        waveform.resetSelectionToFullRange()
+    }
+
+    @objc private func saveRecording() {
+        guard let tempURL = recordingTempURL else { return }
+        let start = trimStart
+        let end = trimEnd
+        guard start < end else {
+            statusLabel.stringValue = "Trim start must be before trim end"
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Save Recording"
+        let suggested = suggestedSaveURL ?? freshSuggestedSaveURL()
+        panel.nameFieldStringValue = suggested.lastPathComponent
+        panel.directoryURL = suggested.deletingLastPathComponent()
+        panel.canCreateDirectories = true
+        if let mp3Type = UTType(filenameExtension: "mp3") {
+            panel.allowedContentTypes = [mp3Type]
+        }
+
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let destination = panel.url else { return }
+            self.performSave(from: tempURL, to: destination, start: start, end: end, duration: self.trimDuration)
+        }
+    }
+
+    private func performSave(from source: URL, to destination: URL, start: Double, end: Double, duration: Double) {
+        statusLabel.stringValue = "Saving…"
+        saveButton.isEnabled = false
+        let isFullRange = start <= 0.05 && end >= duration - 0.05
+
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) { () -> Result<Void, Error> in
+                do {
+                    if FileManager.default.fileExists(atPath: destination.path) {
+                        try FileManager.default.removeItem(at: destination)
+                    }
+                    if isFullRange {
+                        try FileManager.default.copyItem(at: source, to: destination)
+                    } else {
+                        try trimMP3(source: source, destination: destination, start: start, end: end)
+                    }
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+
+            switch outcome {
+            case .success:
+                statusLabel.stringValue = "Saved: \(destination.path)"
+            case .failure(let error):
+                statusLabel.stringValue = "Save failed: \(error)"
+            }
+            saveButton.isEnabled = true
+        }
+    }
+
+    @objc private func clearRecording() {
+        discardPendingRecording()
+        statusLabel.stringValue = "Ready to record"
+    }
+
+    private func discardPendingRecording() {
+        clearPlayback()
+        if let tempURL = recordingTempURL {
+            try? FileManager.default.removeItem(at: tempURL)
+        }
+        recordingTempURL = nil
+        suggestedSaveURL = nil
+        waveform.resetForNewRecording()
+
+        trimBoundsInitialized = false
+        trimStart = 0
+        trimEnd = 0
+        trimDuration = 0
+        trimLabel.stringValue = "Trim: 00:00 – 00:00"
+        resetTrimButton.isEnabled = false
+        saveButton.isEnabled = false
+        clearButton.isEnabled = false
+        playbackSlider.minValue = 0
+        playbackSlider.maxValue = 1
     }
 
     private static func playbackTime(_ seconds: Double) -> String {
@@ -1331,7 +1683,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
     func windowWillClose(_ notification: Notification) {
         Task {
             if coreRecorder != nil || stopSystemRecorder != nil { await stopRecording() }
-            clearPlayback()
+            discardPendingRecording()
             NSApp.terminate(nil)
         }
     }
