@@ -93,6 +93,8 @@ enum RecorderError: Error, CustomStringConvertible {
 struct Options {
     var outputURL: URL
     var deviceName: String?
+    var channelIndex: Int?
+    var monoMix = false
     var meter = false
     var listDevices = false
     var listDevicesJSON = false
@@ -120,7 +122,7 @@ final class FFMpegMP3Writer {
         self.meterHandler = meterHandler
     }
 
-    func startIfNeeded(sampleRate: Double, channels: Int, outputChannels: Int? = nil) throws {
+    func startIfNeeded(sampleRate: Double, channels: Int, outputChannels: Int? = nil, selectedInputChannel: Int? = nil) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -136,7 +138,9 @@ final class FFMpegMP3Writer {
             "-ac", String(channels),
             "-i", "pipe:0",
         ]
-        if let outputChannels, channels > 2, outputChannels == 2 {
+        if let selectedInputChannel {
+            process.arguments?.append(contentsOf: ["-af", "pan=mono|c0=c\(selectedInputChannel)"])
+        } else if let outputChannels, channels > 2, outputChannels == 2 {
             process.arguments?.append(contentsOf: ["-filter:a", "pan=stereo|c0=c0|c1=c1"])
         } else if let outputChannels {
             process.arguments?.append(contentsOf: ["-ac", String(outputChannels)])
@@ -409,19 +413,26 @@ func coreAudioInputDevice(named name: String) throws -> CoreAudioDevice {
 
 final class CoreAudioDeviceRecorder {
     private let deviceName: String
+    private let channelIndex: Int?
+    private let monoMix: Bool
     private let writer: FFMpegMP3Writer
     private var queue: AudioQueueRef?
     private var isRunning = false
     private let lock = NSLock()
 
-    init(deviceName: String, outputURL: URL, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
+    init(deviceName: String, outputURL: URL, channelIndex: Int? = nil, monoMix: Bool = false, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
         self.deviceName = deviceName
+        self.channelIndex = channelIndex
+        self.monoMix = monoMix
         self.writer = FFMpegMP3Writer(outputURL: outputURL, meterEnabled: meterEnabled, meterHandler: meterHandler)
     }
 
     func start() throws {
         let device = try coreAudioInputDevice(named: deviceName)
-        let channels = min(max(device.inputChannels, 1), 2)
+        let channels = max(device.inputChannels, 1)
+        if let channelIndex, !(0..<channels).contains(channelIndex) {
+            throw RecorderError.unsupportedAudioFormat("input channel \(channelIndex + 1) is unavailable on '\(deviceName)' (\(channels) channels)")
+        }
         let sampleRate = device.sampleRate > 0 ? device.sampleRate : 44_100
 
         var format = AudioStreamBasicDescription(
@@ -487,10 +498,14 @@ final class CoreAudioDeviceRecorder {
         try validatePCMFormat(actualFormat)
 
         let inputChannels = Int(actualFormat.mChannelsPerFrame)
+        if let channelIndex, channelIndex >= inputChannels {
+            throw RecorderError.unsupportedAudioFormat("input channel \(channelIndex + 1) is unavailable in the capture stream (\(inputChannels) channels)")
+        }
         try writer.startIfNeeded(
             sampleRate: actualFormat.mSampleRate,
             channels: inputChannels,
-            outputChannels: min(inputChannels, 2)
+            outputChannels: (channelIndex != nil || monoMix) ? 1 : min(inputChannels, 2),
+            selectedInputChannel: channelIndex
         )
 
         let framesPerBuffer = UInt32(actualFormat.mSampleRate / 4)
@@ -847,6 +862,8 @@ func printUsage() {
 
     Options:
       --device NAME      Record from a CoreAudio input device, such as a microphone or "Loopback Audio".
+      --channel NUMBER   Record one 1-based input channel from the selected device as centered mono.
+      --mono-mix         Mix all selected-device input channels to mono.
       --meter            Print RMS meter samples to stdout for a local UI.
       --no-gui           Run in terminal-only mode (used by local integrations).
       --list-devices     List CoreAudio input devices.
@@ -899,6 +916,8 @@ func resolveOutputURL(rawPath: String?) throws -> URL {
 
 func parseOptions(arguments: [String]) throws -> Options {
     var deviceName: String?
+    var channelIndex: Int?
+    var monoMix = false
     var meter = false
     var listDevices = false
     var listDevicesJSON = false
@@ -926,6 +945,18 @@ func parseOptions(arguments: [String]) throws -> Options {
             }
             deviceName = arguments[valueIndex]
             index += 1
+        case "--channel":
+            let valueIndex = index + 1
+            guard valueIndex < arguments.count else {
+                throw RecorderError.missingOptionValue(argument)
+            }
+            guard let channelNumber = Int(arguments[valueIndex]), channelNumber > 0 else {
+                throw RecorderError.unsupportedAudioFormat("--channel must be a positive 1-based channel number")
+            }
+            channelIndex = channelNumber - 1
+            index += 1
+        case "--mono-mix":
+            monoMix = true
         case "--meter":
             meter = true
         default:
@@ -944,6 +975,8 @@ func parseOptions(arguments: [String]) throws -> Options {
     return Options(
         outputURL: try resolveOutputURL(rawPath: outputPath),
         deviceName: deviceName,
+        channelIndex: channelIndex,
+        monoMix: monoMix,
         meter: meter,
         listDevices: listDevices,
         listDevicesJSON: listDevicesJSON,
@@ -1741,7 +1774,7 @@ struct Main {
             blockInterruptSignal()
 
             if let deviceName = options.deviceName {
-                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL, meterEnabled: options.meter)
+                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL, channelIndex: options.channelIndex, monoMix: options.monoMix, meterEnabled: options.meter)
 
                 print("Recording CoreAudio input device '\(deviceName)' to: \(options.outputURL.path)")
                 print("Press Esc or Ctrl-C to stop.")
