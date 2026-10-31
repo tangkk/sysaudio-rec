@@ -139,7 +139,7 @@ final class FFMpegMP3Writer {
             "-i", "pipe:0",
         ]
         if let selectedInputChannel {
-            process.arguments?.append(contentsOf: ["-af", "pan=mono|c0=c\(selectedInputChannel)"])
+            process.arguments?.append(contentsOf: ["-af", "pan=mono|c0=c\(selectedInputChannel)", "-ac", "1"])
         } else if let outputChannels, channels > 2, outputChannels == 2 {
             process.arguments?.append(contentsOf: ["-filter:a", "pan=stereo|c0=c0|c1=c1"])
         } else if let outputChannels {
@@ -1776,7 +1776,13 @@ struct Main {
             if let deviceName = options.deviceName {
                 let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: options.outputURL, channelIndex: options.channelIndex, monoMix: options.monoMix, meterEnabled: options.meter)
 
-                print("Recording CoreAudio input device '\(deviceName)' to: \(options.outputURL.path)")
+                if let channelIndex = options.channelIndex {
+                    print("Recording input channel \(channelIndex + 1) from '\(deviceName)' as mono to: \(options.outputURL.path)")
+                } else if options.monoMix {
+                    print("Recording all input channels from '\(deviceName)' as mono to: \(options.outputURL.path)")
+                } else {
+                    print("Recording CoreAudio input device '\(deviceName)' to: \(options.outputURL.path)")
+                }
                 print("Press Esc or Ctrl-C to stop.")
 
                 try recorder.start()
