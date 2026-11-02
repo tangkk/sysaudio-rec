@@ -113,6 +113,8 @@ final class FFMpegMP3Writer {
     private let meterHandler: ((Double, Double) -> Void)?
     private let meterQueue = DispatchQueue(label: "sysaudio-rec.meter")
     private var started = false
+    private var meterInputChannels = 1
+    private var meterSelectedInputChannel: Int?
     private var lastMeterNanos: UInt64 = 0
     private let lock = NSLock()
 
@@ -154,6 +156,8 @@ final class FFMpegMP3Writer {
         process.standardInput = inputPipe
         try process.run()
         started = true
+        meterInputChannels = max(1, channels)
+        meterSelectedInputChannel = selectedInputChannel
     }
 
     func write(_ data: Data) {
@@ -162,14 +166,16 @@ final class FFMpegMP3Writer {
             lock.unlock()
             return
         }
+        let meterChannels = meterInputChannels
+        let selectedMeterChannel = meterSelectedInputChannel
         writeQueue.async { [inputPipe] in
             inputPipe.fileHandleForWriting.write(data)
         }
         lock.unlock()
-        emitMeter(for: data)
+        emitMeter(for: data, channels: meterChannels, selectedChannel: selectedMeterChannel)
     }
 
-    private func emitMeter(for data: Data) {
+    private func emitMeter(for data: Data, channels: Int, selectedChannel: Int?) {
         guard meterEnabled || meterHandler != nil else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         lock.lock()
@@ -191,7 +197,16 @@ final class FFMpegMP3Writer {
             var count = 0
             data.withUnsafeBytes { rawBuffer in
                 let samples = rawBuffer.bindMemory(to: Int16.self)
-                for sample in samples {
+                let channelStride = max(1, channels)
+                let selected = selectedChannel.flatMap { (0..<channelStride).contains($0) ? $0 : nil }
+                let indices: AnySequence<Int>
+                if let selected {
+                    indices = AnySequence(Swift.stride(from: selected, to: samples.count, by: channelStride))
+                } else {
+                    indices = AnySequence(samples.indices)
+                }
+                for index in indices {
+                    let sample = samples[index]
                     let normalized = Double(sample) / Double(Int16.max)
                     sum += normalized * normalized
                     peak = max(peak, abs(normalized))
@@ -1092,6 +1107,34 @@ func validateOutputFile(_ outputURL: URL) throws {
     }
 }
 
+final class LiveLevelMeterView: NSView {
+    private var rms: CGFloat = 0
+    private var peak: CGFloat = 0
+
+    func setLevels(_ rms: Double, peak: Double) {
+        self.rms = CGFloat(max(0, min(1, rms)))
+        self.peak = CGFloat(max(0, min(1, peak)))
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let track = bounds.insetBy(dx: 1, dy: 2)
+        NSColor(calibratedWhite: 0.88, alpha: 1).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
+        let db = rms > 0 ? 20 * log10(Double(rms)) : -60
+        let fraction = CGFloat(max(0, min(1, (db + 60) / 60)))
+        let fill = NSRect(x: track.minX, y: track.minY, width: track.width * fraction, height: track.height)
+        NSColor.systemGreen.setFill()
+        NSBezierPath(roundedRect: fill, xRadius: 4, yRadius: 4).fill()
+        let peakDB = peak > 0 ? 20 * log10(Double(peak)) : -60
+        let peakFraction = CGFloat(max(0, min(1, (peakDB + 60) / 60)))
+        let x = track.minX + track.width * peakFraction
+        NSColor(calibratedRed: 0.12, green: 0.12, blue: 0.12, alpha: 1).setFill()
+        NSBezierPath(rect: NSRect(x: min(x, track.maxX - 2), y: track.minY, width: 2, height: track.height)).fill()
+    }
+}
+
 final class LiveWaveformView: NSView {
     // Same rolling window and drawing formula as the original scrolling waveform.
     // Recording stops appending to it, so once stopped the bars simply stay put —
@@ -1270,12 +1313,17 @@ final class LiveWaveformView: NSView {
 @MainActor
 final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let options: Options
-    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 440), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 850, height: 500), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     private let sourcePopup = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
+    private let channelPopup = BlackArrowPopUpButton(frame: .zero, pullsDown: false)
     private let recordButton = NSButton(title: "● Record", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "Ready to record")
     private let timerLabel = NSTextField(labelWithString: "00:00")
     private let waveform = LiveWaveformView(frame: .zero)
+    private let levelMeter = LiveLevelMeterView(frame: .zero)
+    private let meterValueLabel = NSTextField(labelWithString: "−∞ dBFS")
+    private let clipLabel = NSTextField(labelWithString: "CLIP")
+    private var inputDevices: [CoreAudioDevice] = []
     private let playbackButton = NSButton(title: "▶ Play", target: nil, action: nil)
     private let playbackSlider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let playbackTimeLabel = NSTextField(labelWithString: "00:00 / 00:00")
@@ -1321,24 +1369,57 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         sourceLabel.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
         sourceRow.addArrangedSubview(sourceLabel)
         sourcePopup.translatesAutoresizingMaskIntoConstraints = false
-        sourcePopup.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        sourcePopup.widthAnchor.constraint(equalToConstant: 300).isActive = true
         sourcePopup.contentTintColor = .black
         sourcePopup.addItem(withTitle: "System audio / Loopback (default)")
         sourcePopup.lastItem?.representedObject = ""
-        for device in (try? coreAudioInputDevices()) ?? [] {
+        inputDevices = (try? coreAudioInputDevices()) ?? []
+        for device in inputDevices {
             sourcePopup.addItem(withTitle: "\(device.name)  ·  \(device.inputChannels) ch  ·  \(Int(device.sampleRate.rounded())) Hz")
             sourcePopup.lastItem?.representedObject = device.name
             if device.name == options.deviceName { sourcePopup.selectItem(at: sourcePopup.numberOfItems - 1) }
         }
         sourceRow.addArrangedSubview(sourcePopup)
+        let channelLabel = NSTextField(labelWithString: "CHANNEL")
+        channelLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        channelLabel.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
+        sourceRow.addArrangedSubview(channelLabel)
+        channelPopup.translatesAutoresizingMaskIntoConstraints = false
+        channelPopup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        channelPopup.contentTintColor = .black
+        sourceRow.addArrangedSubview(channelPopup)
+        sourcePopup.target = self
+        sourcePopup.action = #selector(sourceChanged)
+        updateChannelOptions()
         root.addArrangedSubview(sourceRow)
+
+        let meterRow = NSStackView()
+        meterRow.orientation = .horizontal
+        meterRow.alignment = .centerY
+        meterRow.spacing = 8
+        let meterLabel = NSTextField(labelWithString: "INPUT LEVEL")
+        meterLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        meterLabel.textColor = NSColor(calibratedWhite: 0.48, alpha: 1)
+        meterRow.addArrangedSubview(meterLabel)
+        levelMeter.translatesAutoresizingMaskIntoConstraints = false
+        levelMeter.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        levelMeter.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        meterRow.addArrangedSubview(levelMeter)
+        meterValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        meterValueLabel.textColor = NSColor(calibratedWhite: 0.38, alpha: 1)
+        meterRow.addArrangedSubview(meterValueLabel)
+        clipLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        clipLabel.textColor = .systemRed
+        clipLabel.isHidden = true
+        meterRow.addArrangedSubview(clipLabel)
+        root.addArrangedSubview(meterRow)
 
         waveform.translatesAutoresizingMaskIntoConstraints = false
         waveform.wantsLayer = true
         waveform.layer?.cornerRadius = 12
         waveform.layer?.borderWidth = 1
         waveform.layer?.borderColor = NSColor(calibratedWhite: 0.88, alpha: 1).cgColor
-        waveform.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        waveform.widthAnchor.constraint(equalToConstant: 810).isActive = true
         waveform.heightAnchor.constraint(equalToConstant: 150).isActive = true
         waveform.onSelectionChanged = { [weak self] start, end in
             guard let self else { return }
@@ -1457,15 +1538,57 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
 
     private func meterHandler() -> (Double, Double) -> Void {
         { [weak self] level, peak in
-            DispatchQueue.main.async { self?.waveform.append(level: level, peak: peak) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.waveform.append(level: level, peak: peak)
+                self.levelMeter.setLevels(level, peak: peak)
+                self.meterValueLabel.stringValue = peak > 0 ? String(format: "%.1f dBFS", 20 * log10(peak)) : "−∞ dBFS"
+                if peak >= 0.999 { self.clipLabel.isHidden = false }
+            }
         }
+    }
+
+    @objc private func sourceChanged() {
+        updateChannelOptions()
+    }
+
+    private func updateChannelOptions() {
+        let deviceName = sourcePopup.selectedItem?.representedObject as? String ?? ""
+        guard !deviceName.isEmpty,
+              let device = inputDevices.first(where: { $0.name == deviceName }),
+              device.inputChannels > 1 else {
+            channelPopup.removeAllItems()
+            channelPopup.addItem(withTitle: "Not applicable")
+            channelPopup.isEnabled = false
+            return
+        }
+        let previous = channelPopup.selectedItem?.representedObject as? String
+        channelPopup.removeAllItems()
+        channelPopup.addItem(withTitle: "All inputs (stereo)")
+        channelPopup.lastItem?.representedObject = "all"
+        for channel in 1...device.inputChannels {
+            channelPopup.addItem(withTitle: "Input \(channel) (CH\(channel)) · centered mono")
+            channelPopup.lastItem?.representedObject = "channel:\(channel)"
+        }
+        channelPopup.addItem(withTitle: "All inputs (mono mix)")
+        channelPopup.lastItem?.representedObject = "mix"
+        if let previous, let item = (0..<channelPopup.numberOfItems).map({ channelPopup.item(at: $0)! }).first(where: { ($0.representedObject as? String) == previous }) {
+            channelPopup.select(item)
+        } else {
+            channelPopup.selectItem(at: 0)
+        }
+        channelPopup.isEnabled = true
     }
 
     private func startRecording() async {
         discardPendingRecording()
+        levelMeter.setLevels(0, peak: 0)
+        meterValueLabel.stringValue = "−∞ dBFS"
+        clipLabel.isHidden = true
         recordButton.isEnabled = false
         statusLabel.stringValue = "Starting…"
         let deviceName = sourcePopup.selectedItem?.representedObject as? String ?? ""
+        let selectedChannel = channelPopup.selectedItem?.representedObject as? String ?? "all"
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("sysaudio-rec-\(UUID().uuidString).mp3")
         do {
             if deviceName.isEmpty {
@@ -1480,7 +1603,10 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
                     coreRecorder = recorder
                 }
             } else {
-                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: tempURL, meterHandler: meterHandler())
+                let channelIndex: Int? = selectedChannel.hasPrefix("channel:")
+                    ? Int(selectedChannel.replacingOccurrences(of: "channel:", with: "")).map { $0 - 1 }
+                    : nil
+                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: tempURL, channelIndex: channelIndex, monoMix: selectedChannel == "mix", meterHandler: meterHandler())
                 try recorder.start()
                 coreRecorder = recorder
             }
@@ -1490,6 +1616,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
             RunLoop.main.add(newTimer, forMode: .common)
             timer = newTimer
             sourcePopup.isEnabled = false
+            channelPopup.isEnabled = false
             recordButton.title = "■ Stop recording"
             recordButton.isEnabled = true
             statusLabel.stringValue = "Recording…"
@@ -1529,6 +1656,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
             }
         }
         sourcePopup.isEnabled = true
+        updateChannelOptions()
         recordButton.title = "● Record"
         recordButton.isEnabled = true
     }
