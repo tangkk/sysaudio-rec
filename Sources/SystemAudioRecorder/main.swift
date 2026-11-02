@@ -105,7 +105,8 @@ struct Options {
 let defaultFallbackDeviceName = "Loopback Audio"
 
 final class FFMpegMP3Writer {
-    private let outputURL: URL
+    private let outputURL: URL?
+    var isMonitorOnly: Bool { outputURL == nil }
     private let process = Process()
     private let inputPipe = Pipe()
     private let writeQueue = DispatchQueue(label: "sysaudio-rec.ffmpeg-writer")
@@ -118,7 +119,7 @@ final class FFMpegMP3Writer {
     private var lastMeterNanos: UInt64 = 0
     private let lock = NSLock()
 
-    init(outputURL: URL, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
+    init(outputURL: URL? = nil, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
         self.outputURL = outputURL
         self.meterEnabled = meterEnabled
         self.meterHandler = meterHandler
@@ -130,8 +131,9 @@ final class FFMpegMP3Writer {
 
         guard !started else { return }
 
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
+        if let outputURL {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "error",
@@ -139,22 +141,23 @@ final class FFMpegMP3Writer {
             "-ar", String(Int(sampleRate.rounded())),
             "-ac", String(channels),
             "-i", "pipe:0",
-        ]
-        if let selectedInputChannel {
-            process.arguments?.append(contentsOf: ["-af", "pan=mono|c0=c\(selectedInputChannel)", "-ac", "1"])
-        } else if let outputChannels, channels > 2, outputChannels == 2 {
-            process.arguments?.append(contentsOf: ["-filter:a", "pan=stereo|c0=c0|c1=c1"])
-        } else if let outputChannels {
-            process.arguments?.append(contentsOf: ["-ac", String(outputChannels)])
-        }
-        process.arguments?.append(contentsOf: [
+            ]
+            if let selectedInputChannel {
+                process.arguments?.append(contentsOf: ["-af", "pan=mono|c0=c\(selectedInputChannel)", "-ac", "1"])
+            } else if let outputChannels, channels > 2, outputChannels == 2 {
+                process.arguments?.append(contentsOf: ["-filter:a", "pan=stereo|c0=c0|c1=c1"])
+            } else if let outputChannels {
+                process.arguments?.append(contentsOf: ["-ac", String(outputChannels)])
+            }
+            process.arguments?.append(contentsOf: [
             "-codec:a", "libmp3lame",
             "-b:a", "192k",
             "-y",
             outputURL.path
-        ])
-        process.standardInput = inputPipe
-        try process.run()
+            ])
+            process.standardInput = inputPipe
+            try process.run()
+        }
         started = true
         meterInputChannels = max(1, channels)
         meterSelectedInputChannel = selectedInputChannel
@@ -168,8 +171,10 @@ final class FFMpegMP3Writer {
         }
         let meterChannels = meterInputChannels
         let selectedMeterChannel = meterSelectedInputChannel
-        writeQueue.async { [inputPipe] in
-            inputPipe.fileHandleForWriting.write(data)
+        if outputURL != nil {
+            writeQueue.async { [inputPipe] in
+                inputPipe.fileHandleForWriting.write(data)
+            }
         }
         lock.unlock()
         emitMeter(for: data, channels: meterChannels, selectedChannel: selectedMeterChannel)
@@ -229,6 +234,7 @@ final class FFMpegMP3Writer {
         lock.unlock()
 
         guard wasStarted else { return }
+        guard outputURL != nil else { return }
         writeQueue.sync {
             inputPipe.fileHandleForWriting.closeFile()
         }
@@ -435,7 +441,7 @@ final class CoreAudioDeviceRecorder {
     private var isRunning = false
     private let lock = NSLock()
 
-    init(deviceName: String, outputURL: URL, channelIndex: Int? = nil, monoMix: Bool = false, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
+    init(deviceName: String, outputURL: URL? = nil, channelIndex: Int? = nil, monoMix: Bool = false, meterEnabled: Bool = false, meterHandler: ((Double, Double) -> Void)? = nil) {
         self.deviceName = deviceName
         self.channelIndex = channelIndex
         self.monoMix = monoMix
@@ -523,7 +529,7 @@ final class CoreAudioDeviceRecorder {
             selectedInputChannel: channelIndex
         )
 
-        let framesPerBuffer = UInt32(actualFormat.mSampleRate / 4)
+        let framesPerBuffer = UInt32(actualFormat.mSampleRate / (writer.isMonitorOnly ? 50 : 4))
         let bufferByteSize = max(UInt32(16_384), framesPerBuffer * actualFormat.mBytesPerFrame)
         for _ in 0..<8 {
             var buffer: AudioQueueBufferRef?
@@ -604,12 +610,14 @@ final class CoreAudioDeviceRecorder {
 @available(macOS 13.0, *)
 final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let writer: FFMpegMP3Writer
+    private let errorHandler: ((Error) -> Void)?
     private var stream: SCStream?
     private var sampleRate: Double?
     private var channels: Int?
 
-    init(writer: FFMpegMP3Writer) {
+    init(writer: FFMpegMP3Writer, errorHandler: ((Error) -> Void)? = nil) {
         self.writer = writer
+        self.errorHandler = errorHandler
     }
 
     func start() async throws {
@@ -649,9 +657,13 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("capture stopped: \(error)\n", stderr)
         writer.finish()
-        Foundation.exit(1)
+        if let errorHandler {
+            errorHandler(error)
+        } else {
+            fputs("capture stopped: \(error)\n", stderr)
+            Foundation.exit(1)
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
@@ -1333,6 +1345,10 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
     private let clearButton = NSButton(title: "✕ Clear", target: nil, action: nil)
     private var coreRecorder: CoreAudioDeviceRecorder?
     private var stopSystemRecorder: (() async -> Void)?
+    private var inputMonitor: CoreAudioDeviceRecorder?
+    private var stopSystemMonitor: (() async -> Void)?
+    private var monitorTask: Task<Void, Never>?
+    private var isClosing = false
     private var timer: Timer?
     private var startedAt: Date?
     private var player: AVPlayer?
@@ -1390,6 +1406,8 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         sourceRow.addArrangedSubview(channelPopup)
         sourcePopup.target = self
         sourcePopup.action = #selector(sourceChanged)
+        channelPopup.target = self
+        channelPopup.action = #selector(channelChanged)
         updateChannelOptions()
         root.addArrangedSubview(sourceRow)
 
@@ -1526,6 +1544,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         window.contentView = content
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        scheduleInputMonitoring()
     }
 
     @objc private func toggleRecording() {
@@ -1536,11 +1555,11 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         }
     }
 
-    private func meterHandler() -> (Double, Double) -> Void {
+    private func meterHandler(recording: Bool) -> (Double, Double) -> Void {
         { [weak self] level, peak in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.waveform.append(level: level, peak: peak)
+                if recording { self.waveform.append(level: level, peak: peak) }
                 self.levelMeter.setLevels(level, peak: peak)
                 self.meterValueLabel.stringValue = peak > 0 ? String(format: "%.1f dBFS", 20 * log10(peak)) : "−∞ dBFS"
                 if peak >= 0.999 { self.clipLabel.isHidden = false }
@@ -1550,6 +1569,66 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
 
     @objc private func sourceChanged() {
         updateChannelOptions()
+        scheduleInputMonitoring()
+    }
+
+    @objc private func channelChanged() {
+        scheduleInputMonitoring()
+    }
+
+    private func scheduleInputMonitoring() {
+        guard !isClosing else { return }
+        let previous = monitorTask
+        previous?.cancel()
+        levelMeter.setLevels(0, peak: 0)
+        meterValueLabel.stringValue = "−∞ dBFS"
+        clipLabel.isHidden = true
+        monitorTask = Task {
+            await previous?.value
+            await stopInputMonitoring()
+            guard !Task.isCancelled else { return }
+            await startInputMonitoring()
+        }
+    }
+
+    private func stopInputMonitoring() async {
+        if let stop = stopSystemMonitor {
+            stopSystemMonitor = nil
+            await stop()
+        }
+        inputMonitor?.stop()
+        inputMonitor = nil
+    }
+
+    private func startInputMonitoring() async {
+        let deviceName = sourcePopup.selectedItem?.representedObject as? String ?? ""
+        let selection = channelPopup.selectedItem?.representedObject as? String ?? "all"
+        do {
+            if deviceName.isEmpty, #available(macOS 13.0, *) {
+                let writer = FFMpegMP3Writer(meterHandler: meterHandler(recording: false))
+                let recorder = SystemAudioRecorder(writer: writer) { [weak self] error in
+                    DispatchQueue.main.async { self?.statusLabel.stringValue = "Input monitor stopped: \(error.localizedDescription)" }
+                }
+                try await recorder.start()
+                if Task.isCancelled { await recorder.stop(); return }
+                stopSystemMonitor = { await recorder.stop() }
+            } else {
+                let channelIndex = selection.hasPrefix("channel:")
+                    ? Int(selection.replacingOccurrences(of: "channel:", with: "")).map { $0 - 1 }
+                    : nil
+                let monitor = CoreAudioDeviceRecorder(
+                    deviceName: deviceName.isEmpty ? defaultFallbackDeviceName : deviceName,
+                    channelIndex: channelIndex,
+                    monoMix: selection == "mix",
+                    meterHandler: meterHandler(recording: false)
+                )
+                try monitor.start()
+                if Task.isCancelled { monitor.stop(); return }
+                inputMonitor = monitor
+            }
+        } catch {
+            if !Task.isCancelled { statusLabel.stringValue = "Input monitor unavailable: \(error)" }
+        }
     }
 
     private func updateChannelOptions() {
@@ -1586,19 +1665,25 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         meterValueLabel.stringValue = "−∞ dBFS"
         clipLabel.isHidden = true
         recordButton.isEnabled = false
+        sourcePopup.isEnabled = false
+        channelPopup.isEnabled = false
         statusLabel.stringValue = "Starting…"
+        monitorTask?.cancel()
+        await monitorTask?.value
+        monitorTask = nil
+        await stopInputMonitoring()
         let deviceName = sourcePopup.selectedItem?.representedObject as? String ?? ""
         let selectedChannel = channelPopup.selectedItem?.representedObject as? String ?? "all"
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("sysaudio-rec-\(UUID().uuidString).mp3")
         do {
             if deviceName.isEmpty {
                 if #available(macOS 13.0, *) {
-                    let writer = FFMpegMP3Writer(outputURL: tempURL, meterHandler: meterHandler())
+                    let writer = FFMpegMP3Writer(outputURL: tempURL, meterHandler: meterHandler(recording: true))
                     let recorder = SystemAudioRecorder(writer: writer)
                     try await recorder.start()
                     stopSystemRecorder = { await recorder.stop() }
                 } else {
-                    let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: tempURL, meterHandler: meterHandler())
+                    let recorder = CoreAudioDeviceRecorder(deviceName: defaultFallbackDeviceName, outputURL: tempURL, meterHandler: meterHandler(recording: true))
                     try recorder.start()
                     coreRecorder = recorder
                 }
@@ -1606,7 +1691,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
                 let channelIndex: Int? = selectedChannel.hasPrefix("channel:")
                     ? Int(selectedChannel.replacingOccurrences(of: "channel:", with: "")).map { $0 - 1 }
                     : nil
-                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: tempURL, channelIndex: channelIndex, monoMix: selectedChannel == "mix", meterHandler: meterHandler())
+                let recorder = CoreAudioDeviceRecorder(deviceName: deviceName, outputURL: tempURL, channelIndex: channelIndex, monoMix: selectedChannel == "mix", meterHandler: meterHandler(recording: true))
                 try recorder.start()
                 coreRecorder = recorder
             }
@@ -1623,6 +1708,9 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         } catch {
             statusLabel.stringValue = "Error: \(error)"
             recordButton.isEnabled = true
+            sourcePopup.isEnabled = true
+            updateChannelOptions()
+            scheduleInputMonitoring()
         }
     }
 
@@ -1659,6 +1747,7 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
         updateChannelOptions()
         recordButton.title = "● Record"
         recordButton.isEnabled = true
+        if !isClosing { scheduleInputMonitoring() }
     }
 
     private func freshSuggestedSaveURL() -> URL {
@@ -1849,7 +1938,12 @@ final class GUIRecorderController: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     func windowWillClose(_ notification: Notification) {
+        isClosing = true
         Task {
+            monitorTask?.cancel()
+            await monitorTask?.value
+            monitorTask = nil
+            await stopInputMonitoring()
             if coreRecorder != nil || stopSystemRecorder != nil { await stopRecording() }
             discardPendingRecording()
             NSApp.terminate(nil)
